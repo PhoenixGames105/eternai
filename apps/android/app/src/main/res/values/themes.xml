@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Compose draws everything; the platform theme only hosts the window. -->
+    <style name="Theme.EternAI" parent="android:Theme.Material.NoActionBar">
+        <item name="android:statusBarColor">@color/etern_dark</item>
+        <item name="android:navigationBarColor">@color/etern_dark</item>
+    </style>
+</resources>

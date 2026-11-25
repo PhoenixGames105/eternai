@@ -1,0 +1,11 @@
+# Bindgen config for the Kotlin target (PLAN.md §7).
+# Used by:
+#   cargo run -p etern-ffi --features bindgen-cli -- \
+#     generate --library <cdylib dir> --language kotlin --config uniffi.toml --out-dir <kotlin src dir>
+
+[bindings.kotlin]
+package_name = "dev.eternai.core"
+cdylib_name = "etern_ffi"
+android = true
+# The generated file is large; keep it in one file so Gradle sees one source unit.
+generate_immutable_records = false

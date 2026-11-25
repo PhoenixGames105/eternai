@@ -1,0 +1,25 @@
+/target
+**/target
+node_modules
+dist
+*.log
+*.db
+*.db-wal
+*.db-shm
+/Journal/
+/memory/
+/inbox/
+/secrets/
+*.pem
+*.p12
+*.key
+local.properties
+llama-server-*.txt
+
+# Android / Gradle
+.gradle/
+**/build/
+**/.cxx/
+**/.externalNativeBuild/
+*.apk
+*.aab

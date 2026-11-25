@@ -1,0 +1,30 @@
+[package]
+name = "etern-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "UniFFI bindings exposing etern-core to the Android edge app (PLAN.md §7)"
+
+[lib]
+name = "etern_ffi"
+# cdylib -> the .so the phone loads; lib -> host unit tests.
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[features]
+default = []
+# Kotlin binding generation runs on the host only. Keeping `uniffi/cli` behind a
+# feature stops uniffi_bindgen from being compiled into the Android .so.
+bindgen-cli = ["uniffi/cli"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "uniffi-bindgen.rs"
+required-features = ["bindgen-cli"]
+
+[dependencies]
+etern-core = { path = "../etern-core" }
+uniffi = { version = "0.32" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }

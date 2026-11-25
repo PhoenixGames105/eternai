@@ -1,0 +1,28 @@
+﻿[package]
+name = "etern-gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
+axum = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "blocking"] }
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+etern-core = { path = "../etern-core" }
+futures-util = "0.3"
+sha2 = "0.10"
+uuid = { version = "1", features = ["v7"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Self-signed TLS for the LAN listener. `ring` everywhere keeps the provider
+# consistent with reqwest's rustls-tls and avoids pulling in aws-lc-rs.
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+axum-server = { version = "0.9", default-features = false, features = ["tls-rustls-ring"] }
+base64 = "0.22"
+time = "0.3"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>eternAI</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <div id="app">
+      <header id="topbar">
+        <div class="brand">eternAI</div>
+        <div id="engine-chip" class="chip chip-offline" title="Engine status">
+          <span class="dot"></span><span id="engine-label">checking…</span>
+        </div>
+        <div id="model-chip" class="chip chip-model" title="Loaded model">—</div>
+        <div class="spacer"></div>
+        <nav class="tabs">
+          <button class="tab active" data-view="chat">Chat</button>
+          <button class="tab" data-view="journal">Journal</button>
+          <button class="tab" data-view="settings">Settings</button>
+        </nav>
+      </header>
+
+      <main>
+        <!-- Chat -->
+        <section id="view-chat" class="view active">
+          <div id="chat-log"></div>
+          <form id="chat-form">
+            <textarea
+              id="chat-input"
+              rows="2"
+              placeholder="Message eternAI… (Enter to send, Shift+Enter for newline)"
+            ></textarea>
+            <button id="chat-send" type="submit">Send</button>
+          </form>
+        </section>
+
+        <!-- Journal -->
+        <section id="view-journal" class="view">
+          <div class="journal-pane">
+            <div class="journal-head">
+              <h2>Journal</h2>
+              <button id="journal-refresh" class="ghost" title="Reload list">Refresh</button>
+            </div>
+            <ul id="journal-list" class="journal-list"></ul>
+          </div>
+          <div class="journal-reader">
+            <div id="journal-reader-title" class="journal-reader-title">Select an entry</div>
+            <pre id="journal-reader-body" class="journal-reader-body"></pre>
+          </div>
+        </section>
+
+        <!-- Settings -->
+        <section id="view-settings" class="view">
+          <h2>Gateway connection</h2>
+          <p class="hint">
+            The desktop app is a thin shell over the eternAI gateway. Enter the gateway
+            base URL and bearer token, then save. These are stored locally on this machine.
+          </p>
+          <label class="field">
+            <span>Base URL</span>
+            <input id="set-base" type="text" placeholder="http://127.0.0.1:8090" />
+          </label>
+          <label class="field">
+            <span>Bearer token</span>
+            <input id="set-token" type="password" placeholder="gateway bearer token" />
+          </label>
+          <div class="row">
+            <button id="set-save">Save</button>
+            <button id="set-test" class="ghost">Test connection</button>
+          </div>
+          <div id="set-status" class="status"></div>
+
+          <h2 class="mt">Personality</h2>
+          <p class="hint">
+            A shared style preference for both models. It affects tone only and does not
+            replace system instructions, change tool behavior, or change memory rules.
+            Changes sync through the gateway; the last edit wins.
+          </p>
+          <label class="field">
+            <span>Personality / style</span>
+            <textarea id="set-personality" rows="4" maxlength="2000"
+              placeholder="For example: warm, curious, and concise"></textarea>
+          </label>
+          <div class="row">
+            <button id="set-personality-save">Save personality</button>
+          </div>
+          <div id="set-personality-status" class="status"></div>
+
+          <h2 class="mt">Pairing (phone)</h2>
+          <p class="hint">
+            Generate a one-time code, then scan the QR from the Android app. Choose
+            local Wi-Fi for home-network pairing, or Tailscale when both devices are
+            connected to your tailnet. TLS must be enabled on the gateway
+            (<code>--tls-listen</code>) for the QR to be available.
+          </p>
+          <label class="field">
+            <span>Phone connection</span>
+            <select id="pair-network">
+              <option value="lan">Local Wi-Fi</option>
+              <option value="tailscale">Tailscale</option>
+            </select>
+          </label>
+          <div class="row">
+            <button id="pair-generate">Generate pair code</button>
+            <button id="devices-refresh" class="ghost">Refresh devices</button>
+          </div>
+          <div id="pair-status" class="status"></div>
+          <div id="pair-qr" class="pair-qr" hidden></div>
+          <div id="pair-payload" class="pair-payload" hidden></div>
+          <table id="devices-table" class="devices" hidden>
+            <thead>
+              <tr>
+                <th>Name</th>
+                <th>Token</th>
+                <th>Paired</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="devices-body"></tbody>
+          </table>
+
+          <h2 class="mt">Danger zone</h2>
+          <p class="hint">
+            Deletes every stored conversation turn from the gateway database. Journal
+            entries and paired devices are kept. Do this if a run of bad replies is
+            still being replayed into the phone's context window &mdash; the sync
+            window is built from this database, so clearing only the phone would
+            re-download the same turns.
+          </p>
+          <div class="row">
+            <button id="history-clear" class="ghost">Clear conversation history</button>
+          </div>
+          <div id="history-clear-status" class="status"></div>
+        </section>
+      </main>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
