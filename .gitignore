@@ -23,3 +23,10 @@ llama-server-*.txt
 **/.externalNativeBuild/
 *.apk
 *.aab
+
+# Android native build inputs (see apps/android/native/README.md).
+# opencl-headers is a vendored Khronos checkout; opencl-droid/libOpenCL.so is a
+# driver import library pulled off a device, so it is vendor firmware.
+/opencl-headers/
+/opencl-droid/
+*.diff
