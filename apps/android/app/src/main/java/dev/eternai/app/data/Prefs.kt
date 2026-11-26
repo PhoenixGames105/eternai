@@ -7,6 +7,28 @@ const val MIN_EDGE_MAX_TOKENS = 128
 const val MAX_EDGE_MAX_TOKENS = 20_000
 
 /**
+ * Compute backend for the embedded edge server.
+ *
+ * [deviceName] is what llama.cpp's `-dev` expects: the *registered device*
+ * name, not the backend type. Passing "vulkan"/"opencl" is rejected during
+ * argument parsing. Null means "no GPU device" - the server is started with
+ * `-dev none`, which matters because ggml registers every packaged backend
+ * and would otherwise auto-select a GPU one.
+ */
+enum class EdgeBackend(val id: String, val deviceName: String?, val label: String) {
+    Cpu("cpu", null, "CPU"),
+    Vulkan("vulkan", "Vulkan0", "Vulkan"),
+    OpenCl("opencl", "GPUOpenCL", "OpenCL");
+
+    /** True when this backend runs on the GPU and can therefore fail to start. */
+    val isGpu: Boolean get() = deviceName != null
+
+    companion object {
+        fun fromId(id: String?): EdgeBackend = entries.firstOrNull { it.id == id } ?: Cpu
+    }
+}
+
+/**
  * Where the phone remembers the gateway and its own credential.
  *
  * The device token is a long-lived bearer credential. M7a stores it in the app's
@@ -23,12 +45,26 @@ class Prefs(context: Context) {
         // Earlier diagnostic builds could persist selection of the legacy JNI
         // engine, which does not use llama.cpp's server prompt path. Migrate
         // existing installs once so this update actually exercises the server.
+        val editor = sp.edit()
         if (!sp.getBoolean(KEY_EDGE_SERVER_MIGRATED, false)) {
-            sp.edit()
-                .putBoolean(KEY_EDGE_SERVER, DEFAULT_EDGE_SERVER)
-                .putBoolean(KEY_EDGE_SERVER_MIGRATED, true)
-                .apply()
+            editor.putBoolean(KEY_EDGE_SERVER, DEFAULT_EDGE_SERVER)
+            editor.putBoolean(KEY_EDGE_SERVER_MIGRATED, true)
         }
+        // The GPU setting used to be a Vulkan on/off switch. Carry an old "on"
+        // over as an explicit Vulkan choice, then drop the legacy keys so a
+        // later toggle cannot be shadowed by stale state.
+        if (!sp.getBoolean(KEY_EDGE_BACKEND_MIGRATED, false)) {
+            if (sp.getBoolean("edge_use_vulkan", false)) {
+                editor.putString(KEY_EDGE_BACKEND, EdgeBackend.Vulkan.id)
+            }
+            if (sp.getBoolean("edge_vulkan_failed", false)) {
+                editor.putString(KEY_EDGE_GPU_FAILED, EdgeBackend.Vulkan.id)
+            }
+            editor.remove("edge_use_vulkan")
+            editor.remove("edge_vulkan_failed")
+            editor.putBoolean(KEY_EDGE_BACKEND_MIGRATED, true)
+        }
+        editor.apply()
     }
 
     /** Pairing target from the QR: host, TLS port and the pinned cert. */
@@ -134,6 +170,49 @@ class Prefs(context: Context) {
     val edgeServerPort: Int
         get() = DEFAULT_EDGE_SERVER_PORT
 
+    /**
+     * Compute backend for the embedded edge server.
+     *
+     * CPU is the default. On the Fold 5 neither GPU path beat the CPU in
+     * measured throughput (see [EdgeBackend] and the notes in
+     * [dev.eternai.app.engine.ServerEdgeEngine]), so the GPU backends are
+     * opt-in experiments rather than the recommended setting.
+     */
+    var edgeBackend: EdgeBackend
+        get() = EdgeBackend.fromId(sp.getString(KEY_EDGE_BACKEND, null))
+        set(value) = sp.edit().putString(KEY_EDGE_BACKEND, value.id).apply()
+
+    /**
+     * How many layers to offload to the GPU when a GPU backend is in use. 99
+     * means "all of them", which is what a small edge model wants.
+     */
+    var edgeGpuLayers: Int
+        get() = sp.getInt(KEY_EDGE_GPU_LAYERS, DEFAULT_EDGE_GPU_LAYERS)
+        set(value) = sp.edit().putInt(KEY_EDGE_GPU_LAYERS, value).apply()
+
+    /**
+     * Backend id whose last start failed, so the next launch skips straight to
+     * CPU instead of paying the failure timeout again. Cleared when a start on
+     * that backend succeeds, so a driver update can re-enable the GPU path.
+     */
+    var edgeGpuFailedBackend: String?
+        get() = sp.getString(KEY_EDGE_GPU_FAILED, null)
+        set(value) = sp.edit().putString(KEY_EDGE_GPU_FAILED, value).apply()
+
+    /**
+     * CPU threads for the edge server.
+     *
+     * Deliberately below `availableProcessors()`. The Fold 5 exposes eight
+     * logical CPUs, but llama.cpp's CPU backend peaks at 3-4 threads: measured
+     * on Qwen3.5-4B-Q4_K_XL, 4 threads produced 6.2-6.9 t/s while 6 produced
+     * 5.1-5.7 t/s and 8 produced 4.0 t/s, because the extra workers spill onto
+     * the efficiency cores and contend for the same memory bandwidth the
+     * quantised GEMV kernels are already saturating.
+     */
+    var edgeCpuThreads: Int
+        get() = sp.getInt(KEY_EDGE_CPU_THREADS, DEFAULT_EDGE_CPU_THREADS)
+        set(value) = sp.edit().putInt(KEY_EDGE_CPU_THREADS, value).apply()
+
     // -------------------------------------------------------------------- voice
 
     /**
@@ -189,6 +268,11 @@ class Prefs(context: Context) {
         const val KEY_EDGE_THINKING = "edge_thinking"
         const val KEY_EDGE_SERVER = "edge_use_server"
         const val KEY_EDGE_SERVER_MIGRATED = "edge_server_migrated"
+        const val KEY_EDGE_BACKEND_MIGRATED = "edge_backend_migrated"
+        const val KEY_EDGE_BACKEND = "edge_backend"
+        const val KEY_EDGE_GPU_LAYERS = "edge_gpu_layers"
+        const val KEY_EDGE_GPU_FAILED = "edge_gpu_failed_backend"
+        const val KEY_EDGE_CPU_THREADS = "edge_cpu_threads"
         const val KEY_SPEAK_REPLIES = "speak_replies"
         const val KEY_PERSONALITY = "personality"
         const val KEY_PERSONALITY_UPDATED_AT = "personality_updated_at"
@@ -207,5 +291,7 @@ class Prefs(context: Context) {
         // the closed-block hint needs the headroom or it never reaches an answer.
         const val DEFAULT_EDGE_MAX_TOKENS = 1024
         const val DEFAULT_EDGE_THINKING = false
+        const val DEFAULT_EDGE_CPU_THREADS = 4
+        const val DEFAULT_EDGE_GPU_LAYERS = 99
     }
 }

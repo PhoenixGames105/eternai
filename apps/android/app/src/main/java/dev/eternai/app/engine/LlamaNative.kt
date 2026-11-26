@@ -75,7 +75,7 @@ object LlamaNative {
      * after [ensureLoaded] and before [nativeStartServer]. Pass
      * `context.applicationInfo.nativeLibraryDir`.
      */
-    external fun nativeInit(nativeLibDir: String): Boolean
+    external fun nativeInit(nativeLibDir: String, disableVulkanF16: Boolean): Boolean
 
     /**
      * Starts llama.cpp's own server on a background thread.

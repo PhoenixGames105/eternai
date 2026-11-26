@@ -6,6 +6,7 @@ import android.provider.OpenableColumns
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import dev.eternai.app.EternApplication
+import dev.eternai.app.data.EdgeBackend
 import dev.eternai.app.engine.Engine
 import dev.eternai.app.engine.Finish
 import dev.eternai.app.engine.GatewayEngine
@@ -85,6 +86,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             edgeMaxTokens = prefs.edgeMaxTokens,
             edgeThinking = prefs.edgeThinking,
             engineIsServer = prefs.edgeUseServer,
+            edgeBackend = prefs.edgeBackend,
             voiceAvailable = voiceInput.available,
         ),
     )
@@ -93,6 +95,14 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     val pairing = PairingClient(eternApp)
 
     init {
+        // A GPU choice can outlive the build that supported it - each native
+        // build carries only one GPU backend. Drop such a stale choice so the
+        // picker shows what will actually run.
+        val stored = prefs.edgeBackend
+        if (stored.isGpu && stored !in serverEngine.availableBackends) {
+            prefs.edgeBackend = EdgeBackend.Cpu
+            _ui.update { it.copy(edgeBackend = EdgeBackend.Cpu) }
+        }
         // Mirror the probe into the UI so the model chip updates without polling.
         viewModelScope.launch {
             eternApp.probe.state.collect { state ->
@@ -159,6 +169,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         val edgeThinking: Boolean = false,
         /** True when edge prompts go to the embedded llama.cpp server. */
         val engineIsServer: Boolean = true,
+        /** Which compute backend the edge server should use. */
+        val edgeBackend: EdgeBackend = EdgeBackend.Cpu,
         /** Opens the embedded server's log viewer. */
         val showServerLog: Boolean = false,
     ) {
@@ -480,6 +492,31 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         val enabled = !_ui.value.edgeThinking
         prefs.edgeThinking = enabled
         _ui.update { it.copy(edgeThinking = enabled) }
+        viewModelScope.launch(Dispatchers.IO) {
+            llamaEngine.unload()
+            serverEngine.unload()
+        }
+    }
+
+    /**
+     * Backends the installed APK actually carries a library for, so the picker
+     * never offers a GPU that was not built in.
+     */
+    val availableBackends: List<EdgeBackend>
+        get() = serverEngine.availableBackends
+
+    /**
+     * Chooses the compute backend for the edge server.
+     *
+     * The device list is fixed at server start, so changing it restarts the
+     * server on the next prompt. Selecting a backend also clears that backend's
+     * remembered start failure, so an explicit retry is always honoured.
+     */
+    fun setEdgeBackend(backend: EdgeBackend) {
+        if (backend == _ui.value.edgeBackend) return
+        prefs.edgeBackend = backend
+        if (backend.isGpu) prefs.edgeGpuFailedBackend = null
+        _ui.update { it.copy(edgeBackend = backend) }
         viewModelScope.launch(Dispatchers.IO) {
             llamaEngine.unload()
             serverEngine.unload()

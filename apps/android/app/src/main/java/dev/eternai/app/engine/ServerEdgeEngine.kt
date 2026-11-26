@@ -2,7 +2,9 @@ package dev.eternai.app.engine
 
 import android.content.Context
 import android.net.Uri
+import android.os.Build
 import android.util.Log
+import dev.eternai.app.data.EdgeBackend
 import dev.eternai.app.data.Prefs
 import dev.eternai.app.util.optStringOrNull
 import dev.eternai.core.MessageDto
@@ -57,9 +59,39 @@ class ServerEdgeEngine(
      */
     private val nativeLibDir: String = context.applicationInfo.nativeLibraryDir
 
+    /**
+     * The Fold 5's Adreno driver fails to create the Vulkan FP16 matvec
+     * pipeline. Disable Vulkan FP16 before backend registration so ggml uses
+     * its FP32 shader variants instead.
+     */
+    private val disableVulkanF16: Boolean =
+        Build.MANUFACTURER.equals("samsung", ignoreCase = true) &&
+            Build.MODEL.startsWith("SM-F946", ignoreCase = true)
+
     /** File the embedded server writes its logs to; the debug screen tails it. */
     val logFile: File = File(context.filesDir, "logs").apply { mkdirs() }
         .let { File(it, "llama-server.log") }
+
+    /** Preserves the log from the last GPU start that failed, for the debug view. */
+    private val gpuFailureLogFile: File
+        get() = File(logFile.parentFile, "llama-server-gpu-failure.log")
+
+    /**
+     * Backends this APK can actually start.
+     *
+     * With `GGML_BACKEND_DL=ON` each backend is a separate `libggml-<name>.so`
+     * that ggml dlopen's out of [nativeLibDir], and a build only carries the one
+     * it was configured for - building with `-OpenCL` deletes the Vulkan lib and
+     * vice versa. Offering a backend whose library was never packaged would just
+     * produce a start failure, so the picker hides it.
+     */
+    val availableBackends: List<EdgeBackend>
+        get() = EdgeBackend.entries.filter { backend ->
+            when (backend) {
+                EdgeBackend.Cpu -> true
+                else -> File(nativeLibDir, "libggml-${backend.id}.so").isFile
+            }
+        }
 
     private val startMutex = Mutex()
 
@@ -119,23 +151,35 @@ class ServerEdgeEngine(
      * stall the UI thread that renders it.
      */
     fun readLogTail(maxBytes: Long = 64L * 1024): String {
-        val file = logFile
-        if (!file.isFile) return "no log yet"
+        if (!logFile.isFile && !gpuFailureLogFile.isFile) return "no log yet"
         return try {
-            val length = file.length()
-            if (length <= maxBytes) {
-                file.readText()
-            } else {
-                RandomAccessFile(file, "r").use { raf ->
-                    raf.seek(length - maxBytes)
-                    val buf = ByteArray(maxBytes.toInt())
-                    raf.readFully(buf)
-                    // Drop the first (likely partial) line.
-                    String(buf, Charsets.UTF_8).substringAfter('\n')
+            val halfLimit = (maxBytes / 2).coerceAtLeast(1)
+            val current = readFileTail(logFile, halfLimit)
+            val failedGpu = readFileTail(gpuFailureLogFile, halfLimit)
+            buildString {
+                if (current.isNotEmpty()) {
+                    append("=== Current server run ===\n")
+                    append(current)
+                }
+                if (failedGpu.isNotEmpty()) {
+                    append("\n=== Previous GPU startup failure ===\n")
+                    append(failedGpu)
                 }
             }
         } catch (t: Exception) {
             "reading log failed: " + (t.message ?: t.javaClass.simpleName)
+        }
+    }
+
+    private fun readFileTail(file: File, maxBytes: Long): String {
+        if (!file.isFile) return ""
+        val length = file.length()
+        if (length <= maxBytes) return file.readText()
+        return RandomAccessFile(file, "r").use { raf ->
+            raf.seek(length - maxBytes)
+            val buf = ByteArray(maxBytes.toInt())
+            raf.readFully(buf)
+            String(buf, Charsets.UTF_8).substringAfter('\n')
         }
     }
 
@@ -150,11 +194,27 @@ class ServerEdgeEngine(
     suspend fun exportLog(uri: Uri): Result<Long> = withContext(Dispatchers.IO) {
         runCatching {
             val source = logFile
-            if (!source.isFile) error("no log has been written yet")
+            val failedGpu = gpuFailureLogFile
+            if (!source.isFile && !failedGpu.isFile) error("no log has been written yet")
             val target = appContext.contentResolver.openOutputStream(uri, "wt")
                 ?: error("could not open the chosen file for writing")
-            target.use { out -> source.inputStream().use { it.copyTo(out) } }
-            source.length()
+            var bytesWritten = 0L
+            target.use { out ->
+                if (failedGpu.isFile) {
+                    val failedHeader =
+                        "=== Previous GPU startup failure ===\n".toByteArray(Charsets.UTF_8)
+                    out.write(failedHeader)
+                    bytesWritten += failedHeader.size
+                    bytesWritten += failedGpu.inputStream().use { it.copyTo(out) }
+                    val currentHeader = "\n=== Current server run ===\n".toByteArray(Charsets.UTF_8)
+                    out.write(currentHeader)
+                    bytesWritten += currentHeader.size
+                }
+                if (source.isFile) {
+                    bytesWritten += source.inputStream().use { it.copyTo(out) }
+                }
+            }
+            bytesWritten
         }
     }
 
@@ -174,7 +234,9 @@ class ServerEdgeEngine(
         // The CPU backends are separate dlopen-able libs; register them before
         // the server thread calls llama_backend_init(). Idempotent.
         if (!backendsLoaded) {
-            backendsLoaded = withContext(Dispatchers.IO) { LlamaNative.nativeInit(nativeLibDir) }
+            backendsLoaded = withContext(Dispatchers.IO) {
+                LlamaNative.nativeInit(nativeLibDir, disableVulkanF16)
+            }
             if (!backendsLoaded) {
                 Log.w(TAG, "no ggml backend registered from $nativeLibDir")
             }
@@ -187,11 +249,47 @@ class ServerEdgeEngine(
             withContext(Dispatchers.IO) { LlamaNative.nativeStopServer() }
         }
 
-        val args = buildArgs(file)
+        val backend = activeBackend()
+        if (backend.isGpu && gpuFailureLogFile.exists() && !gpuFailureLogFile.delete()) {
+            Log.w(TAG, "could not clear the previous GPU failure log")
+        }
+        val error = startAndWait(file, buildArgs(file, backend), signature)
+        if (error == null) return@withLock null
+
+        // GPU start failed: remember it, fall back to CPU so the phone
+        // always has an edge engine.
+        if (backend.isGpu) {
+            Log.w(TAG, "${backend.label} start failed ($error); falling back to CPU")
+            prefs.edgeGpuFailedBackend = backend.id
+            withContext(Dispatchers.IO) { LlamaNative.nativeStopServer() }
+            try {
+                if (logFile.isFile) {
+                    logFile.copyTo(gpuFailureLogFile, overwrite = true)
+                }
+                gpuFailureLogFile.appendText(
+                    "\n=== ${backend.label} fallback reason ===\n$error\n",
+                    Charsets.UTF_8,
+                )
+            } catch (t: Exception) {
+                Log.e(TAG, "could not preserve failed ${backend.label} server log", t)
+            }
+            val cpuSignature = signature(file)
+            val cpuError = startAndWait(file, buildArgs(file, EdgeBackend.Cpu), cpuSignature)
+            if (cpuError == null) return@withLock null
+            return@withLock "${backend.label} failed ($error); CPU fallback also failed: $cpuError"
+        }
+        return@withLock error
+    }
+
+    /**
+     * Starts the server with [args] and waits for it to report a loaded model.
+     * Returns null on success or an error message on failure.
+     */
+    private suspend fun startAndWait(file: File, args: List<String>, signature: String): String? {
         val started = withContext(Dispatchers.IO) {
             LlamaNative.nativeStartServer(args.toTypedArray(), logFile.absolutePath)
         }
-        if (!started) return@withLock "failed to start llama-server"
+        if (!started) return "failed to start llama-server"
 
         // Wait for /health to report the model is loaded. Loading a GGUF takes
         // seconds, so poll rather than assume. A run is only declared dead once
@@ -202,17 +300,22 @@ class ServerEdgeEngine(
         val deadline = System.currentTimeMillis() + STARTUP_TIMEOUT_MS
         while (System.currentTimeMillis() < deadline) {
             if (LlamaNative.nativeServerReturned()) {
-                return@withLock "llama-server exited during startup: " + readLogTail(2048).trim()
+                return "llama-server exited during startup: " + readLogTail(2048).trim()
             }
             if (healthOk()) {
                 modelName = propsModel()
                 startedSignature = signature
+                if (activeBackend().isGpu) {
+                    // A healthy GPU start clears any remembered failure so a
+                    // driver update can re-enable the GPU path.
+                    prefs.edgeGpuFailedBackend = null
+                }
                 Log.i(TAG, "embedded server ready: $model (${file.length() / (1024 * 1024)} MB)")
-                return@withLock null
+                return null
             }
             delay(500)
         }
-        return@withLock "timed out loading ${file.name}: " + readLogTail(2048).trim()
+        return "timed out loading ${file.name}: " + readLogTail(2048).trim()
     }
 
     override suspend fun generate(
@@ -389,8 +492,10 @@ class ServerEdgeEngine(
      * API key; the built-in web UI is disabled because this fork ships no
      * compatible UI assets and the app talks to the OpenAI endpoint directly.
      */
-    private fun buildArgs(file: File): List<String> {
-        val threads = Runtime.getRuntime().availableProcessors().coerceIn(2, 6)
+    private fun buildArgs(file: File, backend: EdgeBackend = activeBackend()): List<String> {
+        // Even in GPU mode the CPU runs the sampler and any op the backend
+        // cannot handle, so it still needs workers - just not all of them.
+        val threads = prefs.edgeCpuThreads.coerceIn(1, 8)
         val args = mutableListOf(
             "-m", file.absolutePath,
             "--host", "127.0.0.1",
@@ -412,13 +517,47 @@ class ServerEdgeEngine(
         } else {
             args += listOf("--reasoning", "off")
         }
+        if (backend.isGpu) {
+            // llama.cpp expects the registered device name (Vulkan0 /
+            // GPUOpenCL), not the backend type. The latter is rejected while
+            // parsing arguments.
+            args += listOf("-dev", backend.deviceName!!, "-ngl", prefs.edgeGpuLayers.toString())
+        } else {
+            // llama.cpp defaults GPU offload to "auto". Since nativeInit
+            // registers every packaged backend (including the GPU ones), CPU
+            // mode must explicitly exclude GPU devices to avoid silently
+            // selecting one and crashing on unsupported device shaders.
+            args += listOf("-dev", "none", "-ngl", "0")
+        }
         return args
     }
+
+    /**
+     * The backend to start with: the user's choice, downgraded to CPU when that
+     * GPU cannot be used.
+     *
+     * Two things disqualify a GPU backend: its previous start failed (so the
+     * next launch skips the failure timeout), and its library is not in this
+     * APK - a build carries either the Vulkan or the OpenCL backend, never both,
+     * and a stored preference from an older build must not stall startup on a
+     * device that was never packaged.
+     */
+    private fun activeBackend(): EdgeBackend {
+        val wanted = prefs.edgeBackend
+        if (!wanted.isGpu) return EdgeBackend.Cpu
+        if (!isPackaged(wanted)) return EdgeBackend.Cpu
+        return if (prefs.edgeGpuFailedBackend == wanted.id) EdgeBackend.Cpu else wanted
+    }
+
+    private fun isPackaged(backend: EdgeBackend): Boolean =
+        backend == EdgeBackend.Cpu ||
+            File(nativeLibDir, "libggml-${backend.id}.so").isFile
 
     private fun signature(file: File): String =
         listOf(
             file.absolutePath, file.length(),
             prefs.edgeContextSize, prefs.edgeThinking, prefs.edgeServerPort,
+            activeBackend(), prefs.edgeGpuLayers, prefs.edgeCpuThreads,
         ).joinToString("|")
 
     private fun toWire(messages: List<MessageDto>): JSONArray {

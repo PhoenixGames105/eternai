@@ -24,8 +24,21 @@ param(
     [string]$Abi = "arm64-v8a",
     [int]$Api = 28,
     [switch]$Vulkan,
-    [string]$SpirvHeaders = "C:\spirv-headers",
-    [string]$Glslc = "$Ndk\shader-tools\windows-x86_64\glslc.exe"
+    # OpenCL backend. Chosen because the Adreno 740 driver rejects ggml-vulkan's
+    # matmul_quant_f32 module outright (reproduced across 15 configurations and
+    # with pristine upstream shaders), while its OpenCL 3.0 driver compiles and
+    # runs kernels correctly. The NDK ships neither OpenCL headers nor a
+    # libOpenCL.so import library, so both are supplied here: Khronos headers,
+    # and the device's own loader as the link stub. That stub's SONAME is
+    # libOpenCL.so, so the resulting DT_NEEDED resolves at runtime to the
+    # vendor library, which /vendor/etc/public.libraries.txt allows apps to use.
+    [switch]$OpenCL,
+    [string]$OpenCLHeaders = "E:\eternAI\opencl-headers",
+    [string]$OpenCLStub = "E:\eternAI\opencl-droid\libOpenCL.so",
+    # The Vulkan SDK supplies the modern glslc (the NDK's is from 2022 and
+    # cannot target vulkan1.3), the SPIRV-Headers CMake config, and the
+    # FindVulkan support files. Install: winget install KhronosGroup.VulkanSDK
+    [string]$VulkanSdk = "C:\VulkanSDK\1.4.363.0"
 )
 
 # Native tools write warnings to stderr; with "Stop" PowerShell 5.1 promotes
@@ -46,6 +59,8 @@ foreach ($p in @($Toolchain, $Cmake, $Ninja, $LlamaDir)) {
 
 if ($Vulkan) {
     $BuildDir = Join-Path $Native "build\vulkan-$Abi"
+} elseif ($OpenCL) {
+    $BuildDir = Join-Path $Native "build\opencl-$Abi"
 } else {
     $BuildDir = Join-Path $Native "build\cpu-$Abi"
 }
@@ -90,19 +105,60 @@ if (Test-Path $UiDist) {
 
 $backend = @("-DGGML_VULKAN=OFF")
 if ($Vulkan) {
-    if (-not (Test-Path $Glslc)) { throw "glslc not found at $Glslc" }
+    $sdkGlslc = Join-Path $VulkanSdk "Bin\glslc.exe"
+    if (-not (Test-Path $sdkGlslc)) { throw "glslc not found at $sdkGlslc (install the Vulkan SDK: winget install KhronosGroup.VulkanSDK)" }
     $sysroot = "$Ndk\toolchains\llvm\prebuilt\windows-x86_64\sysroot"
+    # The NDK ships libvulkan.so only per API level (it is a dlsym stub; the
+    # real loader is the device's), so point at the one matching $Api.
+    $vulkanStub = "$sysroot\usr\lib\aarch64-linux-android\$Api\libvulkan.so"
+    if (-not (Test-Path $vulkanStub)) { throw "libvulkan.so stub not found at $vulkanStub" }
     $backend = @(
         "-DGGML_VULKAN=ON",
-        "-DVulkan_GLSLC_EXECUTABLE=$Glslc",
-        "-DVulkan_LIBRARY=$sysroot\usr\lib\aarch64-linux-android\libvulkan.so",
-        "-DVulkan_INCLUDE_DIR=$sysroot\usr\include",
-        "-DSPIRV-Headers_SOURCE_DIR=$SpirvHeaders",
-        "-DSPIRV_HEADERS_INCLUDE_DIR=$SpirvHeaders\include"
+        # CMAKE_PREFIX_PATH lets find_package(Vulkan COMPONENTS glslc) resolve
+        # from the SDK. SPIRV-Headers is resolved via the local shim instead:
+        # the SDK's own config is generated for an install layout it does not
+        # actually have (headers at Include\spirv, not next to the config).
+        "-DCMAKE_PREFIX_PATH=$VulkanSdk",
+        "-DSPIRV-Headers_DIR=$Native\cmake",
+        "-DVULKAN_SDK_ROOT=$VulkanSdk",
+        "-DVulkan_GLSLC_EXECUTABLE=$sdkGlslc",
+        "-DVulkan_LIBRARY=$vulkanStub",
+        # The SDK's Include has both the C headers (vulkan.h) and the C++
+        # bindings (vulkan.hpp) that ggml-vulkan needs. The NDK sysroot only
+        # has the C header, so it cannot serve as the include dir.
+        "-DVulkan_INCLUDE_DIR=$VulkanSdk\Include",
+        # The shader generator sub-build must compile a Windows host tool, so
+        # it needs a real host compiler (MSVC), not the NDK clang. This
+        # variable makes ggml-vulkan use our toolchain file verbatim instead
+        # of generating one that hardcodes the NDK clang.
+        "-DGGML_VULKAN_SHADERS_GEN_TOOLCHAIN=$Native\cmake\host-msvc.cmake"
+    )
+} elseif ($OpenCL) {
+    if (-not (Test-Path (Join-Path $OpenCLHeaders "CL\cl.h"))) {
+        throw "OpenCL headers not found at $OpenCLHeaders\CL\cl.h"
+    }
+    if (-not (Test-Path $OpenCLStub)) {
+        throw "OpenCL import library not found at $OpenCLStub"
+    }
+    $backend = @(
+        "-DGGML_OPENCL=ON",
+        # FindOpenCL only needs a header root and something linkable. The NDK
+        # sysroot has neither, so hand it the Khronos headers and the device's
+        # own libOpenCL.so (pulled off the phone) as the link stub. Its SONAME
+        # is libOpenCL.so, so the DT_NEEDED entry resolves at runtime to the
+        # vendor loader rather than to a bundled copy.
+        "-DOpenCL_INCLUDE_DIR=$OpenCLHeaders",
+        "-DOpenCL_LIBRARY=$OpenCLStub",
+        # Kernels are embedded as C string literals, so nothing has to be read
+        # from disk at runtime -- there is no assets path inside the APK.
+        "-DGGML_OPENCL_EMBED_KERNELS=ON",
+        "-DGGML_OPENCL_USE_ADRENO_KERNELS=ON",
+        # The device driver reports OpenCL 3.0.
+        "-DGGML_OPENCL_TARGET_VERSION=300"
     )
 }
 
-Write-Host "==> configure ($Abi, vulkan=$Vulkan)"
+Write-Host "==> configure ($Abi, vulkan=$Vulkan, opencl=$OpenCL)"
 & $Cmake -S $LlamaDir -B $BuildDir -G Ninja @common @backend
 if ($LASTEXITCODE -ne 0) { throw "configure failed" }
 
@@ -110,7 +166,22 @@ Write-Host "==> build llama.cpp shared libraries (server included)"
 # With BUILD_SHARED_LIBS=ON every target is a .so. llama-server-impl transitively
 # covers server-context, ui, httplib, mtmd, common and llama; ggml covers the
 # base plus every dlopen-able CPU variant.
-& $Cmake --build $BuildDir --target llama-server-impl llama-common llama ggml -j 8
+# The Vulkan shader generator is an ExternalProject that re-runs CMake from
+# scratch; it does not inherit our -DCMAKE_MAKE_PROGRAM, so it must find ninja
+# on PATH. Prepend the SDK's cmake bin dir for the duration of the build.
+$env:PATH = (Split-Path $Ninja) + ";" + $env:PATH
+if ($Vulkan) {
+    # The shader generator sub-build compiles a Windows host tool with MSVC,
+    # so the build must run inside a vcvars64 environment (cl on PATH).
+    $VcVars = "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
+    if (-not (Test-Path $VcVars)) { throw "vcvars64.bat not found at $VcVars (Vulkan build needs the MSVC host toolchain)" }
+    $buildCmd = @"
+call "$VcVars" >nul && "$Cmake" --build "$BuildDir" --target llama-server-impl llama-common llama ggml -j 8
+"@
+    & $env:ComSpec /c $buildCmd
+} else {
+    & $Cmake --build $BuildDir --target llama-server-impl llama-common llama ggml -j 8
+}
 if ($LASTEXITCODE -ne 0) { throw "build failed" }
 
 # ---------------------------------------------------------------- JNI wrapper
@@ -139,17 +210,26 @@ if ($LASTEXITCODE -ne 0) { throw "engine build failed" }
 $Socopy = Join-Path $Native "..\app\src\main\jniLibs\$Abi"
 # Android variant names look like ggml-cpu-android_armv8.2_2, so the character
 # class needs underscores and dots as well as alphanumerics.
-$SoPattern = '^(lib)?(ggml|ggml-base|ggml-cpu-[a-z0-9._]+|llama|llama-common|llama-common-base|llama-server-impl|server-context|llama-ui|mtmd|cpp-httplib|vendor-hash)\.so$'
+# ggml-vulkan is the Vulkan backend (a separate .so when GGML_VULKAN=ON); it
+# must ship so the server can dlopen it. The CPU variants are dlopen'd the same
+# way, which is why every produced .so is copied, not just the linked ones.
+$SoPattern = '^(lib)?(ggml|ggml-base|ggml-cpu-[a-z0-9._]+|ggml-vulkan|ggml-opencl|llama|llama-common|llama-common-base|llama-server-impl|server-context|llama-ui|mtmd|cpp-httplib|vendor-hash)\.so$'
 
 if (Test-Path $Socopy) {
-    Remove-Item (Join-Path $Socopy "*.so") -Force -ErrorAction SilentlyContinue
-} else {
     New-Item -ItemType Directory -Force -Path $Socopy | Out-Null
 }
 
 $produced = Get-ChildItem -Recurse $BuildDir -Filter "*.so" |
     Where-Object { $_.Name -match $SoPattern }
 if (-not $produced) { throw "no llama.cpp shared libraries found under $BuildDir" }
+
+# Only delete what this build actually replaces. A blanket "*.so" wipe made a
+# -OpenCL build silently destroy libggml-vulkan.so (and vice versa), so the app
+# could only ever expose one GPU backend at a time and a stored preference could
+# point at a library that was no longer packaged.
+$produced | ForEach-Object {
+    Remove-Item (Join-Path $Socopy $_.Name) -Force -ErrorAction SilentlyContinue
+}
 $produced | ForEach-Object { Copy-Item $_.FullName $Socopy -Force }
 
 $EngineSo = Join-Path $EngineBuild "libetern_engine.so"

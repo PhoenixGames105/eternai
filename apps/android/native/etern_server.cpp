@@ -13,7 +13,7 @@
 //   nativeServerRunning()    -> a run is live (loading or serving)
 //   nativeServerReturned()   -> no run is in progress; combined with the above
 //                               this separates "still loading" from "died"
-//   nativeStopServer()       -> retry llama_server_terminate() until the run ends
+//   nativeStopServer()       -> request termination once and join the run
 //
 // llama_server() blocks inside start_loop() until terminate() is called, so a
 // single background thread is enough; the caller never waits on it directly.
@@ -28,13 +28,16 @@
 
 #include <jni.h>
 #include <android/log.h>
+#include <sys/system_properties.h>
 
 #include "common/log.h"
 #include "ggml-backend.h"
 
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <ctime>
+#include <exception>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -58,6 +61,41 @@ void llama_server_reset();
 
 namespace {
 
+// Escape hatch for driver workarounds: `adb shell setprop debug.eternai.vk.env
+// "GGML_VK_DISABLE_DOT2=1 ..."` applies GGML_VK_* variables on the next server
+// start, so a candidate workaround can be tried on the device without a new
+// APK. The property is unset in normal use, which leaves behaviour unchanged.
+// A second property carries extra assignments because a property value is
+// capped at 92 bytes.
+void apply_vulkan_env_overrides() {
+    for (const char * prop_name : { "debug.eternai.vk.env", "debug.eternai.vk.env2" }) {
+        char value[92] = {};
+        if (__system_property_get(prop_name, value) <= 0 || value[0] == '\0') {
+            continue;
+        }
+        std::string text(value);
+        size_t pos = 0;
+        while (pos < text.size()) {
+            size_t space = text.find(' ', pos);
+            if (space == std::string::npos) {
+                space = text.size();
+            }
+            std::string token = text.substr(pos, space - pos);
+            const size_t eq = token.find('=');
+            if (eq != std::string::npos && eq > 0) {
+                const std::string name = token.substr(0, eq);
+                const std::string val  = token.substr(eq + 1);
+                if (setenv(name.c_str(), val.c_str(), 1) == 0) {
+                    SLOGI("vulkan override %s=%s", name.c_str(), val.c_str());
+                } else {
+                    SLOGE("setenv(%s) failed", name.c_str());
+                }
+            }
+            pos = space + 1;
+        }
+    }
+}
+
 std::thread        g_server_thread;
 std::atomic<bool>  g_server_running{false};
 std::atomic<bool>  g_server_returned{true};
@@ -77,9 +115,18 @@ void run_server(std::vector<std::string> args) {
 
     SLOGI("starting embedded llama-server with %d args", (int) argv.size());
 
-    const int rc = llama_server((int) argv.size(), argv.data());
+    int rc = -1;
+    try {
+        rc = llama_server((int) argv.size(), argv.data());
+    } catch (const std::exception & e) {
+        SLOGE("embedded llama-server threw an exception: %s", e.what());
+        common_log_add(common_log_main(), GGML_LOG_LEVEL_ERROR,
+                       "embedded llama-server threw an exception: %s\n", e.what());
+    }
 
     SLOGI("embedded llama-server returned %d", rc);
+    common_log_add(common_log_main(), GGML_LOG_LEVEL_INFO,
+                   "embedded llama-server returned %d\n", rc);
     // g_server_returned is published last: a waiter that sees it can also see
     // the run as finished and stop poking it.
     g_server_running.store(false);
@@ -97,7 +144,8 @@ extern "C" {
 // auto-discovery can't find libraries inside an APK. Mirrors the init order in
 // llama.cpp's own Android example.
 JNIEXPORT jboolean JNICALL
-Java_dev_eternai_app_engine_LlamaNative_nativeInit(JNIEnv * env, jclass, jstring libDir) {
+Java_dev_eternai_app_engine_LlamaNative_nativeInit(JNIEnv * env, jclass, jstring libDir,
+                                                   jboolean disableVulkanF16) {
     if (libDir == nullptr) {
         SLOGE("nativeInit called without a native library dir");
         return JNI_FALSE;
@@ -106,6 +154,18 @@ Java_dev_eternai_app_engine_LlamaNative_nativeInit(JNIEnv * env, jclass, jstring
     if (dir == nullptr) {
         return JNI_FALSE;
     }
+    // Must be set before loading the Vulkan backend: the Fold 5's Adreno
+    // driver fails Vulkan FP16 matvec pipeline creation.
+    if (disableVulkanF16 == JNI_TRUE) {
+        if (setenv("GGML_VK_DISABLE_F16", "1", 1) != 0) {
+            SLOGE("could not enable the Adreno Vulkan FP16 workaround");
+            env->ReleaseStringUTFChars(libDir, dir);
+            return JNI_FALSE;
+        }
+        SLOGI("Adreno workaround enabled: Vulkan FP16 shaders disabled");
+    }
+    apply_vulkan_env_overrides();
+
     const size_t before = ggml_backend_reg_count();
     ggml_backend_load_all_from_path(dir);
     const size_t after = ggml_backend_reg_count();
@@ -159,6 +219,15 @@ Java_dev_eternai_app_engine_LlamaNative_nativeStartServer(JNIEnv * env, jclass, 
             std::strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S UTC", &tm_utc);
             common_log_add(common_log_main(), GGML_LOG_LEVEL_INFO,
                            "=== embedded llama-server start %s ===\n", stamp);
+            // Echo the full command line so a log export shows exactly which
+            // mode (Vulkan vs CPU) this run started in.
+            std::string cmdline;
+            for (const auto & a : argv) {
+                cmdline += a;
+                cmdline += ' ';
+            }
+            common_log_add(common_log_main(), GGML_LOG_LEVEL_INFO,
+                           "args: %s\n", cmdline.c_str());
             // Echo the backend state into the same file the debug viewer tails:
             // with GGML_BACKEND_DL a zero count means nativeInit never ran and
             // every tensor would fall back to a reference path.
@@ -200,18 +269,20 @@ Java_dev_eternai_app_engine_LlamaNative_nativeStopServer(JNIEnv *, jclass) {
     }
 
     // llama_server_terminate() is a no-op until the run has installed its own
-    // shutdown handler, which upstream does only after the model has loaded. A
-    // stop that arrives during loading therefore has to be retried, otherwise
-    // the request is silently dropped and the join below blocks forever.
+    // shutdown handler, which upstream does only after the model has loaded.
+    // Wait for that handler, then call it exactly once: termination is not
+    // reentrant because it stops and tears down the server queue.
     //
     // The server publishes readiness only after assigning the handler. This
     // avoids concurrently reading its std::function while the server thread
     // installs it during model loading.
     // The loop ends when the handler stops the run, or when the run fails and
     // publishes g_server_returned.
+    bool termination_requested = false;
     for (int attempt = 0; !g_server_returned.load(); ++attempt) {
-        if (llama_server_termination_ready()) {
+        if (!termination_requested && llama_server_termination_ready()) {
             llama_server_terminate();
+            termination_requested = true;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
         if (attempt > 0 && attempt % 100 == 0) {

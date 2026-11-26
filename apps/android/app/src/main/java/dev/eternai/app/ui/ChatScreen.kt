@@ -41,6 +41,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Slider
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -497,6 +498,28 @@ private fun ModelSheet(vm: ChatViewModel) {
                 )
             }
             if (ui.engineIsServer) {
+                Spacer(Modifier.height(8.dp))
+                Text("Compute backend", style = MaterialTheme.typography.bodyMedium)
+                Text(
+                    "CPU is the fastest option measured on this device. The GPU " +
+                        "backends are experimental: on the Fold 5 neither Vulkan nor " +
+                        "OpenCL beat the CPU, and a GPU start that fails falls back " +
+                        "to CPU automatically.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(Modifier.height(8.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    vm.availableBackends.forEach { backend ->
+                        FilterChip(
+                            selected = ui.edgeBackend == backend,
+                            onClick = { vm.setEdgeBackend(backend) },
+                            label = {
+                                Text(if (backend.isGpu) "${backend.label} (exp)" else backend.label)
+                            },
+                        )
+                    }
+                }
                 Spacer(Modifier.height(8.dp))
                 OutlinedButton(
                     onClick = { vm.showServerLog() },
