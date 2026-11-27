@@ -8,6 +8,21 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.FilledIconButton
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
@@ -17,18 +32,20 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.navigationBars
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -53,6 +70,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -61,6 +79,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.ui.input.pointer.pointerInput
@@ -111,17 +130,43 @@ fun ChatScreen(vm: ChatViewModel) {
         }
     }
 
+    // The Fold's cover display is ~400dp wide while the inner one is ~690dp, so
+    // the bar and the input row have to fall back to a stacked layout below the
+    // point where a single row stops fitting.
+    val wide = LocalConfiguration.current.screenWidthDp >= 520
+
     Scaffold(
         topBar = {
+            // The cover display is ~400dp wide: the status has to ellipsize and the
+            // secondary actions collapse into an overflow menu, otherwise the title
+            // and chips squeeze each other into multiple lines.
             TopAppBar(
-                title = { Text("eternAI") },
+                title = {
+                    // The title slot is not a RowScope, so it cannot be weighted;
+                    // ellipsizing alone keeps a long label from pushing the actions
+                    // off the end of a cover-display bar.
+                    Text(
+                        "eternAI",
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                },
                 actions = {
-                    StatusChip(ui)
-                    TextButton(onClick = { vm.showModelPicker() }, enabled = !ui.busy) {
-                        Text("Model")
-                    }
-                    TextButton(onClick = { vm.syncNow() }, enabled = ui.paired && !ui.busy) {
-                        Text("Sync")
+                    StatusChip(ui, wide)
+                    if (wide) {
+                        TextButton(onClick = { vm.showModelPicker() }, enabled = !ui.busy) {
+                            Text("Model")
+                        }
+                        TextButton(onClick = { vm.syncNow() }, enabled = ui.paired && !ui.busy) {
+                            Text("Sync")
+                        }
+                    } else {
+                        OverflowMenu(
+                            modelEnabled = !ui.busy,
+                            syncEnabled = ui.paired && !ui.busy,
+                            onModel = { vm.showModelPicker() },
+                            onSync = { vm.syncNow() },
+                        )
                     }
                 },
             )
@@ -174,11 +219,13 @@ fun ChatScreen(vm: ChatViewModel) {
 
             val listState = rememberLazyListState()
             val bubbles = ui.bubbles
-            // Re-anchor when the keyboard opens too: the viewport shrinks, which can
-            // otherwise leave the newest bubble hidden behind the input row.
-            LaunchedEffect(bubbles.size, bubbles.lastOrNull()?.text?.length, keyboardHeight) {
-                if (bubbles.isNotEmpty()) listState.animateScrollToItem(bubbles.lastIndex)
-            }
+            StickToBottom(
+                listState = listState,
+                bubbleCount = bubbles.size,
+                lastTextLength = bubbles.lastOrNull()?.text?.length ?: 0,
+                busy = ui.busy,
+                keyboardHeight = keyboardHeight,
+            )
 
             Box(Modifier.weight(1f)) {
                 if (bubbles.isEmpty()) {
@@ -210,46 +257,78 @@ fun ChatScreen(vm: ChatViewModel) {
                 }
             }
 
-            Row(
-                Modifier
-                    .fillMaxWidth()
-                    .padding(top = 8.dp, bottom = 12.dp),
-                verticalAlignment = Alignment.Bottom,
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                if (ui.voiceAvailable) {
-                    OutlinedButton(
-                        onClick = { onMic() },
-                        enabled = !ui.busy || ui.listening,
-                    ) { Text(if (ui.listening) "Listening" else "Mic") }
+            // On the cover display a single row leaves the text field so narrow
+            // that even its label wraps to three lines, so the voice toggles move
+            // to a second row and the field keeps the full width.
+            if (wide) {
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .padding(top = 8.dp, bottom = 12.dp),
+                    verticalAlignment = Alignment.Bottom,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    VoiceControls(
+                        ui,
+                        listening = ui.listening,
+                        onMic = { onMic() },
+                        onToggleSpeak = { vm.toggleSpeakReplies() },
+                    )
+                    OutlinedTextField(
+                        value = prompt,
+                        onValueChange = { prompt = it },
+                        label = { PromptLabel(ui) },
+                        maxLines = 5,
+                        modifier = Modifier
+                            .weight(1f)
+                            .heightIn(max = 160.dp),
+                    )
+                    SendButton(
+                        enabled = prompt.isNotBlank() && !ui.busy,
+                        onSend = {
+                            vm.send(prompt)
+                            prompt = ""
+                        },
+                    )
                 }
-                OutlinedButton(onClick = { vm.toggleSpeakReplies() }) {
-                    Text(if (ui.speakReplies) "Speak: on" else "Speak: off")
-                }
-                OutlinedTextField(
-                    value = prompt,
-                    onValueChange = { prompt = it },
-                    label = {
-                        Text(
-                            when {
-                                ui.listening -> "Listening..."
-                                ui.online -> "Ask the high power model"
-                                else -> "Ask the edge model"
+            } else {
+                Column(
+                    Modifier
+                        .fillMaxWidth()
+                        .padding(top = 8.dp, bottom = 12.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.Bottom,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        OutlinedTextField(
+                            value = prompt,
+                            onValueChange = { prompt = it },
+                            label = { PromptLabel(ui) },
+                            maxLines = 5,
+                            modifier = Modifier
+                                .weight(1f)
+                                .heightIn(max = 160.dp),
+                        )
+                        SendButton(
+                            enabled = prompt.isNotBlank() && !ui.busy,
+                            onSend = {
+                                vm.send(prompt)
+                                prompt = ""
                             },
                         )
-                    },
-                    maxLines = 5,
-                    modifier = Modifier
-                        .weight(1f)
-                        .heightIn(max = 160.dp),
-                )
-                Button(
-                    onClick = {
-                        vm.send(prompt)
-                        prompt = ""
-                    },
-                    enabled = prompt.isNotBlank() && !ui.busy,
-                ) { Text("Send") }
+                    }
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        VoiceControls(
+                            ui,
+                            listening = ui.listening,
+                            onMic = { onMic() },
+                            onToggleSpeak = { vm.toggleSpeakReplies() },
+                        )
+                    }
+                }
             }
         }
 
@@ -318,14 +397,199 @@ private fun ServerLogSheet(vm: ChatViewModel) {
     }
 }
 
+/**
+ * Overflow entry point for the secondary actions on a narrow screen.
+ *
+ * "Model" and "Sync" are used rarely enough that a menu is cheaper than the
+ * ~160dp two text buttons would cost on the cover display.
+ */
 @Composable
-private fun StatusChip(ui: ChatViewModel.UiState) {
-    val label = when {
-        !ui.paired -> "not paired"
-        ui.online -> "desktop: " + (ui.model.ifEmpty { ui.engineState })
-        else -> "edge (" + ui.engineState + ")"
+private fun OverflowMenu(
+    modelEnabled: Boolean,
+    syncEnabled: Boolean,
+    onModel: () -> Unit,
+    onSync: () -> Unit,
+) {
+    var open by remember { mutableStateOf(false) }
+    Box {
+        IconButton(onClick = { open = true }) {
+            Icon(Icons.Filled.MoreVert, contentDescription = "More actions")
+        }
+        DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+            DropdownMenuItem(
+                text = { Text("Model") },
+                enabled = modelEnabled,
+                onClick = {
+                    open = false
+                    onModel()
+                },
+            )
+            DropdownMenuItem(
+                text = { Text("Sync now") },
+                enabled = syncEnabled,
+                onClick = {
+                    open = false
+                    onSync()
+                },
+            )
+        }
     }
-    AssistChip(onClick = { }, label = { Text(label, style = MaterialTheme.typography.labelSmall) })
+}
+
+/**
+ * Placeholder for the prompt field, kept to a single line so a narrow screen
+ * cannot stack it into three lines and shrink the field itself.
+ */
+@Composable
+private fun PromptLabel(ui: ChatViewModel.UiState) {
+    Text(
+        when {
+            ui.listening -> "Listening..."
+            ui.online -> "Ask the desktop"
+            else -> "Ask the edge model"
+        },
+        maxLines = 1,
+        overflow = TextOverflow.Ellipsis,
+    )
+}
+
+/** Dictation and read-aloud toggles; grouped so they can share a row. */
+@Composable
+private fun VoiceControls(
+    ui: ChatViewModel.UiState,
+    listening: Boolean,
+    onMic: () -> Unit,
+    onToggleSpeak: () -> Unit,
+) {
+    val compact = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+    if (ui.voiceAvailable) {
+        OutlinedButton(
+            onClick = onMic,
+            enabled = !ui.busy || listening,
+            contentPadding = compact,
+        ) {
+            Text(if (listening) "Listening" else "Mic", maxLines = 1)
+        }
+    }
+    OutlinedButton(
+        onClick = onToggleSpeak,
+        contentPadding = compact,
+    ) {
+        Text(if (ui.speakReplies) "Speak on" else "Speak off", maxLines = 1)
+    }
+}
+
+/**
+ * Icon-only send control. A text button costs ~90dp of the ~400dp cover
+ * display, which is what left the prompt field unusable.
+ */
+@Composable
+private fun SendButton(enabled: Boolean, onSend: () -> Unit) {
+    FilledIconButton(onClick = onSend, enabled = enabled) {
+        Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Send")
+    }
+}
+
+/**
+ * Follows the conversation only while the user is already at the bottom.
+ *
+ * The previous behaviour re-scrolled on every streamed token, which fought any
+ * attempt to read a long reply while it was still being written. Scrolling up
+ * (or dragging up) detaches, and returning to the bottom re-attaches.
+ */
+@Composable
+private fun StickToBottom(
+    listState: LazyListState,
+    bubbleCount: Int,
+    lastTextLength: Int,
+    busy: Boolean,
+    keyboardHeight: Dp,
+) {
+    var following by remember { mutableStateOf(true) }
+    var lastCount by remember { mutableStateOf(bubbleCount) }
+
+    // A bubble taller than the viewport can never report itself as fully
+    // visible, so "at bottom" means the last item is the last one laid out and
+    // nothing further can be scrolled to.
+    fun atBottom(): Boolean {
+        val info = listState.layoutInfo
+        val last = info.visibleItemsInfo.lastOrNull() ?: return true
+        return last.index >= info.totalItemsCount - 1 && !listState.canScrollForward
+    }
+
+    // Sending a message always re-attaches, even if the user had scrolled up to
+    // re-read something older.
+    LaunchedEffect(bubbleCount) {
+        if (bubbleCount > lastCount) following = true
+        lastCount = bubbleCount
+    }
+
+    // Direction is sampled from the scroll position itself rather than from the
+    // settled drag state: waiting for the gesture to end would let a token that
+    // arrives in between yank the view back down over the user's finger.
+    LaunchedEffect(listState) {
+        var previous: Pair<Int, Int>? = null
+        snapshotFlow {
+            listState.firstVisibleItemIndex to listState.firstVisibleItemScrollOffset
+        }.collect { current ->
+            val before = previous
+            previous = current
+            val scrolledUp = before != null &&
+                (current.first < before.first ||
+                    (current.first == before.first && current.second < before.second))
+            following = if (scrolledUp) false else atBottom() || following
+        }
+    }
+
+    LaunchedEffect(bubbleCount, lastTextLength, busy, keyboardHeight) {
+        if (bubbleCount == 0 || !following) return@LaunchedEffect
+        if (listState.isScrollInProgress) return@LaunchedEffect
+        // A plain scrollBy (not animateScrollToItem) keeps up with tokens that
+        // arrive faster than an animation frame and never jumps over a bubble.
+        listState.scrollBy(100_000f)
+    }
+}
+
+@Composable
+private fun StatusChip(ui: ChatViewModel.UiState, wide: Boolean) {
+    val (label, tint) = when {
+        !ui.paired -> "not paired" to MaterialTheme.colorScheme.outline
+        ui.online -> "desktop" to MaterialTheme.colorScheme.primary
+        else -> "edge" to MaterialTheme.colorScheme.tertiary
+    }
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .clip(CircleShape)
+            .background(MaterialTheme.colorScheme.surfaceVariant)
+            .padding(horizontal = 10.dp, vertical = 6.dp),
+    ) {
+        Box(
+            Modifier
+                .size(8.dp)
+                .clip(CircleShape)
+                .background(tint),
+        )
+        Spacer(Modifier.width(6.dp))
+        Text(
+            label,
+            style = MaterialTheme.typography.labelSmall,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+        // The engine/model name is only useful once it is actually known, and
+        // only affordable on a screen wide enough to show it.
+        if (wide && ui.online && ui.model.isNotBlank()) {
+            Text(
+                " · " + ui.model,
+                style = MaterialTheme.typography.labelSmall,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.widthIn(max = 220.dp),
+            )
+        }
+    }
 }
 
 /**
