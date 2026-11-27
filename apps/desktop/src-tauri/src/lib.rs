@@ -301,6 +301,37 @@ fn qr_svg(data: &str, module_px: u32) -> Result<String, String> {
 
 // -- streaming chat ---------------------------------------------------------
 
+/// In-flight turns, so `chat_cancel` can stop one by its id.
+///
+/// The frontend mints the id, so a stale cancel for a finished turn is simply a
+/// miss. Entries are removed by `chat_send` when the turn ends.
+#[derive(Default)]
+pub struct Turns(std::sync::Mutex<std::collections::HashMap<String, tool_loop::CancelFlag>>);
+
+impl Turns {
+    fn register(&self, id: &str) -> tool_loop::CancelFlag {
+        let flag = tool_loop::CancelFlag::default();
+        self.0
+            .lock()
+            .expect("turn registry poisoned")
+            .insert(id.to_string(), flag.clone());
+        flag
+    }
+
+    fn finish(&self, id: &str) {
+        self.0
+            .lock()
+            .expect("turn registry poisoned")
+            .remove(id);
+    }
+
+    fn cancel(&self, id: &str) {
+        if let Some(flag) = self.0.lock().expect("turn registry poisoned").get(id) {
+            flag.cancel();
+        }
+    }
+}
+
 /// Runs one chat turn to completion, relaying progress to the frontend:
 ///   `chat://delta` `{ id, delta }`          assistant text
 ///   `chat://tool`  `{ id, tool, ok, error }` one executed tool step
@@ -310,7 +341,12 @@ fn qr_svg(data: &str, module_px: u32) -> Result<String, String> {
 /// The frontend awaits this command only for the terminal error case; deltas
 /// arrive as they are parsed from the SSE stream.
 #[tauri::command]
-async fn chat_send(app: tauri::AppHandle, conn: Conn, req: ChatRequest) -> Result<(), String> {
+async fn chat_send(
+    app: tauri::AppHandle,
+    conn: Conn,
+    req: ChatRequest,
+    turns: tauri::State<'_, Turns>,
+) -> Result<(), String> {
     let ChatRequest {
         id,
         messages,
@@ -330,6 +366,7 @@ async fn chat_send(app: tauri::AppHandle, conn: Conn, req: ChatRequest) -> Resul
         options["temperature"] = json!(t);
     }
 
+    let cancel = turns.register(&id);
     let outcome = tool_loop::run(
         &tool_loop::TauriSink(&app),
         &conn,
@@ -337,12 +374,21 @@ async fn chat_send(app: tauri::AppHandle, conn: Conn, req: ChatRequest) -> Resul
         &options,
         &id,
         &personality,
+        &cancel,
     )
-    .await?;
+    .await;
+    turns.finish(&id);
+    let outcome = outcome?;
     // When the round budget ran out the closing line is ours, not the model's,
     // so it never passed through the stream — deliver it like any other delta.
     if outcome.aborted {
         let _ = app.emit("chat://delta", json!({ "id": id, "delta": outcome.reply }));
+    }
+    if outcome.cancelled {
+        let _ = app.emit(
+            "chat://notice",
+            json!({ "id": id, "message": "stopped by you" }),
+        );
     }
     let _ = app.emit("chat://done", json!({ "id": id }));
 
@@ -371,6 +417,16 @@ async fn chat_send(app: tauri::AppHandle, conn: Conn, req: ChatRequest) -> Resul
         }
     }
     Ok(())
+}
+
+/// Stops the turn with this id.
+///
+/// Cancellation is cooperative: the loop notices between chunks and at the next
+/// round boundary, then records whatever it had already produced. Unknown or
+/// finished ids are ignored.
+#[tauri::command]
+fn chat_cancel(turns: tauri::State<'_, Turns>, id: String) {
+    turns.cancel(&id);
 }
 
 /// The `/etern/turns` body for one finished exchange, or `None` when there is
@@ -431,6 +487,7 @@ pub fn recordable_turn(turn_id: &str, exchange: &[ChatMessage]) -> Option<Value>
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .manage(Turns::default())
         .invoke_handler(tauri::generate_handler![
             gateway_health,
             gateway_props,
@@ -439,6 +496,7 @@ pub fn run() {
             journal_read,
             chat_history,
             chat_send,
+            chat_cancel,
             history_clear,
             pair_create,
             devices_list,

@@ -34,8 +34,31 @@ impl Sink for TauriSink<'_> {
     }
 }
 
-/// A model stuck in a loop must not spend the whole machine.
-pub const MAX_ROUNDS: usize = 8;
+/// A model stuck in a loop must not spend the whole machine, but the cap exists
+/// to stop a runaway model, not to interrupt a working one — a real research
+/// turn can chain many reads and searches. Stopping a turn is the user's job;
+/// see [`CancelFlag`].
+pub const MAX_ROUNDS: usize = 100;
+
+/// Cooperative cancellation for one in-flight turn.
+///
+/// The gateway's stream is owned by this process, so the only way to stop a
+/// generation promptly is to notice a flag between chunks and stop reading. The
+/// engine may finish its own decode in the background; nothing more reaches the
+/// shell, and the next turn supersedes it.
+#[derive(Clone, Default)]
+pub struct CancelFlag(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl CancelFlag {
+    pub fn cancel(&self) {
+        self.0
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn cancelled(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
 
 /// OpenAI-compatible tool-call wire form, used both as `assistant.tool_calls`
 /// in the transcript and as the batch body for the gateway.
@@ -104,6 +127,8 @@ pub struct Outcome {
     pub exchange: Vec<ChatMessage>,
     /// True when the round budget ran out rather than the model finishing.
     pub aborted: bool,
+    /// True when the user stopped the turn; `reply` is whatever streamed first.
+    pub cancelled: bool,
 }
 
 // -- SSE reassembly ---------------------------------------------------------
@@ -301,6 +326,7 @@ pub async fn run<S: Sink + ?Sized>(
     options: &Value,
     id: &str,
     personality: &str,
+    cancel: &CancelFlag,
 ) -> Result<Outcome, String> {
     // The caller hands us the whole history with the new prompt already
     // appended. That prompt is part of what happened this turn, so the
@@ -344,7 +370,14 @@ pub async fn run<S: Sink + ?Sized>(
     let mut steps: Vec<Step> = Vec::new();
 
     for _round in 1..=MAX_ROUNDS {
-        let (text, native_calls) = generate(sink, conn, &messages, options, id, mode, &specs).await?;
+        // A stop pressed while the previous round's tools ran ends the turn
+        // here rather than buying one more generation.
+        if cancel.cancelled() {
+            return Ok(stopped(prompt, messages, prompt_len, String::new()));
+        }
+
+        let (text, native_calls, halted) =
+            generate(sink, conn, &messages, options, id, mode, &specs, cancel).await?;
 
         let calls: Vec<ToolCall> = match mode {
             ToolMode::Native => native_calls,
@@ -369,6 +402,16 @@ pub async fn run<S: Sink + ?Sized>(
             _ => text.clone(),
         };
 
+        if halted {
+            // Stop was pressed mid-token. Whatever streamed is the answer the
+            // user got, and it belongs in the exchange — otherwise the journal
+            // holds the question with no reply at all.
+            if !reply.trim().is_empty() {
+                messages.push(ChatMessage::text("assistant", &reply));
+            }
+            return Ok(stopped(prompt, messages, prompt_len, reply));
+        }
+
         if calls.is_empty() {
             // The closing line belongs in the exchange: it is the only answer
             // the journal and the edge window will ever see for this turn.
@@ -381,6 +424,7 @@ pub async fn run<S: Sink + ?Sized>(
                 reply,
                 exchange,
                 aborted: false,
+                cancelled: false,
             });
         }
 
@@ -457,13 +501,38 @@ pub async fn run<S: Sink + ?Sized>(
         reply,
         exchange,
         aborted: true,
+        cancelled: false,
     })
+}
+
+/// Assembles the outcome of a turn the user stopped.
+///
+/// A stopped turn is still history: the prompt and any tool traffic really
+/// happened, so the exchange is handed back whole and the journal records it.
+fn stopped(
+    prompt: Vec<ChatMessage>,
+    mut messages: Vec<ChatMessage>,
+    prompt_len: usize,
+    reply: String,
+) -> Outcome {
+    let mut exchange = prompt;
+    exchange.extend(messages.split_off(prompt_len));
+    Outcome {
+        reply,
+        exchange,
+        aborted: false,
+        cancelled: true,
+    }
 }
 
 // -- generation -------------------------------------------------------------
 
 /// Streams one generation, forwarding text as it arrives and collecting any
 /// tool calls the engine streams alongside it.
+///
+/// Returns the raw text, the tool calls, and whether the stream was cut short
+/// by a stop — in which case the caller must not treat the text as a finished
+/// reply.
 async fn generate<S: Sink + ?Sized>(
     sink: &S,
     conn: &Conn,
@@ -472,7 +541,8 @@ async fn generate<S: Sink + ?Sized>(
     id: &str,
     mode: ToolMode,
     specs: &Value,
-) -> Result<(String, Vec<ToolCall>), String> {
+    cancel: &CancelFlag,
+) -> Result<(String, Vec<ToolCall>, bool), String> {
     let mut body = json!({ "messages": messages, "stream": true });
     if let (Some(map), Some(opts)) = (body.as_object_mut(), options.as_object()) {
         for (key, value) in opts {
@@ -506,17 +576,38 @@ async fn generate<S: Sink + ?Sized>(
     let mut gate = TextGate::new(etern_core::ETOOL_MARKER);
     let mut buf = String::new();
     let mut stream = Box::pin(resp.bytes_stream());
-    while let Some(chunk) = stream.next().await {
-        let chunk = match chunk {
-            Ok(c) => c,
-            Err(e) => {
-                sink.emit(
-                    "chat://error",
-                    json!({ "id": id, "message": format!("stream error: {e}") }),
-                );
-                return Err(format!("stream error: {e}"));
+    let mut halted = false;
+    loop {
+        // Poll on a timer as well as on data: a long prompt evaluation streams
+        // nothing at all, and a stop pressed during it would otherwise wait for
+        // the first token.
+        let next = tokio::time::timeout(std::time::Duration::from_millis(200), stream.next()).await;
+        let chunk = match next {
+            Err(_elapsed) => {
+                if cancel.cancelled() {
+                    halted = true;
+                    break;
+                }
+                continue;
             }
+            Ok(None) => break,
+            Ok(Some(result)) => match result {
+                Ok(c) => c,
+                Err(e) => {
+                    sink.emit(
+                        "chat://error",
+                        json!({ "id": id, "message": format!("stream error: {e}") }),
+                    );
+                    return Err(format!("stream error: {e}"));
+                }
+            },
         };
+        if cancel.cancelled() {
+            // Dropping the stream here closes the connection; the engine may
+            // finish its own decode, but nothing further reaches the shell.
+            halted = true;
+            break;
+        }
         buf.push_str(&String::from_utf8_lossy(&chunk));
         while let Some(pos) = buf.find('\n') {
             let line = buf[..pos].trim_end_matches('\r').to_string();
@@ -539,7 +630,7 @@ async fn generate<S: Sink + ?Sized>(
     }
 
     let raw = gate.full.clone();
-    if mode == ToolMode::Text {
+    if mode == ToolMode::Text && !halted {
         // Whatever `strip` keeps beyond what was already streamed still needs
         // to reach the screen (prose written after the protocol line, say).
         let stripped = etern_core::strip_text_tool(&raw);
@@ -547,7 +638,7 @@ async fn generate<S: Sink + ?Sized>(
             sink.emit("chat://delta", json!({ "id": id, "delta": rest }));
         }
     }
-    Ok((raw, acc.calls()))
+    Ok((raw, acc.calls(), halted))
 }
 
 // -- gateway plumbing -------------------------------------------------------

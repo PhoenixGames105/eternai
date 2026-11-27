@@ -58,12 +58,26 @@ class GatewayEngine(private val app: EternApplication) : Engine {
             Log.w(TAG, "gateway chat failed: ${e.message}")
             Reply(text.toString(), Finish.Error, name, model, "gateway ${e.status}: ${e.message}")
         } catch (e: java.io.IOException) {
-            Log.w(TAG, "gateway stream broke: ${e.message}")
-            Reply(text.toString(), Finish.Error, name, model, "network: ${e.message}")
+            // Hanging the call up in cancel() surfaces here too, worded
+            // differently per HTTP protocol version, so trust the latch.
+            if (app.gateway.cancelledByUser) {
+                Reply(text.toString(), Finish.Cancelled, name, model)
+            } else {
+                Log.w(TAG, "gateway stream broke: ${e.message}")
+                Reply(text.toString(), Finish.Error, name, model, "network: ${e.message}")
+            }
         } catch (e: org.json.JSONException) {
             Log.w(TAG, "gateway sent a non-JSON chunk: ${e.message}")
             Reply(text.toString(), Finish.Error, name, model, "malformed stream: ${e.message}")
         }
+    }
+
+    /**
+     * Drops the gateway stream. The gateway's own decode continues to
+     * completion, but nothing more reaches the phone and the turn ends here.
+     */
+    override fun cancel() {
+        app.gateway.cancelActive()
     }
 
     private fun toWire(messages: List<MessageDto>): JSONArray {

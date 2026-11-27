@@ -162,12 +162,36 @@ class GatewayClient(private val prefs: Prefs) {
      * Streaming chat completion. Returns the raw SSE body as a cold flow of
      * `data:` payloads; the caller assembles deltas.
      */
+    /**
+     * The in-flight stream, so [cancelActive] can hang it up when the user
+     * stops a turn. Only one chat stream runs at a time.
+     */
+    @Volatile
+    private var activeCall: okhttp3.Call? = null
+
+    /**
+     * Latched by [cancelActive] so the socket error it provokes is reported as a
+     * stop rather than a network fault. OkHttp words that error differently per
+     * protocol version ("Canceled" over HTTP/1, "stream was reset: CANCEL" over
+     * HTTP/2), so it cannot be recognised from the message.
+     */
+    @Volatile
+    var cancelledByUser = false
+        private set
+
+    /** Aborts the in-flight [chatStream]. Safe when nothing is streaming. */
+    fun cancelActive() {
+        cancelledByUser = true
+        activeCall?.cancel()
+    }
+
     suspend fun chatStream(
         device: DeviceIdentity,
         bodyJson: String,
         onDelta: (String) -> Unit,
     ): Boolean {
         val (_, c) = client()
+        cancelledByUser = false
         val request = Request.Builder()
             .url(baseUrl() + "/v1/chat/completions")
             .header("authorization", "Bearer ${device.token}")
@@ -175,24 +199,32 @@ class GatewayClient(private val prefs: Prefs) {
             .post(bodyJson.toRequestBody(json))
             .build()
 
-        c.newCall(request).execute().use { resp ->
-            if (!resp.isSuccessful) {
-                throw GatewayException(resp.code, "chat failed: HTTP ${resp.code}")
-            }
-            val source = resp.body?.source()
-                ?: throw GatewayException(message = "chat returned no body")
-            var done = false
-            while (!done) {
-                val line = source.readUtf8Line() ?: break
-                if (!line.startsWith("data:")) continue
-                val payload = line.substring(5).trim()
-                if (payload.isEmpty() || payload == "[DONE]") {
-                    done = payload == "[DONE]"
-                    continue
+        val call = c.newCall(request)
+        activeCall = call
+        // A stop that landed between rounds, before this call existed, still applies.
+        if (cancelledByUser) call.cancel()
+        try {
+            call.execute().use { resp ->
+                if (!resp.isSuccessful) {
+                    throw GatewayException(resp.code, "chat failed: HTTP ${resp.code}")
                 }
-                onDelta(payload)
+                val source = resp.body?.source()
+                    ?: throw GatewayException(message = "chat returned no body")
+                var done = false
+                while (!done) {
+                    val line = source.readUtf8Line() ?: break
+                    if (!line.startsWith("data:")) continue
+                    val payload = line.substring(5).trim()
+                    if (payload.isEmpty() || payload == "[DONE]") {
+                        done = payload == "[DONE]"
+                        continue
+                    }
+                    onDelta(payload)
+                }
+                return true
             }
-            return true
+        } finally {
+            activeCall = null
         }
     }
 

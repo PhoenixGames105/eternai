@@ -33,6 +33,8 @@ class ToolLoop(
         val steps: List<MessageDto>,
         val rounds: Int,
         val aborted: Boolean = false,
+        /** The user pressed stop; [text] is whatever streamed before it. */
+        val cancelled: Boolean = false,
         /** The generation that produced [text]; null when the budget ran out. */
         val reply: Reply? = null,
     )
@@ -43,22 +45,52 @@ class ToolLoop(
      * @param onChunk streams only the assistant's prose; tool traffic is
      *   reported separately by the caller's status text rather than mixed into
      *   the answer.
+     * @param onGenerate reports the engine immediately before each generation,
+     *   so the caller can offer a way to stop one that is in flight.
+     * @param stopRequested polled before each round; when it says true the loop
+     *   ends at the next safe point with [ToolOutcome.cancelled]. Checking a
+     *   flag as well as the engine's own cancellation matters because a stop
+     *   pressed while a tool runs would otherwise buy another full round.
      */
     suspend fun run(
         messages: List<MessageDto>,
         onTool: (ToolResult) -> Unit = {},
         onChunk: (String) -> Unit,
+        onGenerate: (Engine) -> Unit = {},
+        stopRequested: () -> Boolean = { false },
     ): ToolOutcome {
         val working = messages.toMutableList()
         val steps = mutableListOf<MessageDto>()
         val tools = runner.definitions()
+        var prose = ""
         var rounds = 0
 
         while (rounds < MAX_ROUNDS) {
+            if (stopRequested()) {
+                return ToolOutcome(
+                    text = prose,
+                    steps = steps,
+                    rounds = rounds,
+                    cancelled = true,
+                )
+            }
+            onGenerate(engine)
             val reply = engine.generate(working, tools) { chunk ->
                 if (chunk.text.isNotEmpty()) onChunk(chunk.text)
             }
             rounds++
+            prose = reply.text
+            if (reply.finish == Finish.Cancelled) {
+                // The user stopped this turn. Whatever streamed so far is the
+                // answer they got; the caller records it as a partial turn.
+                return ToolOutcome(
+                    text = reply.text,
+                    steps = steps,
+                    rounds = rounds,
+                    cancelled = true,
+                    reply = reply,
+                )
+            }
             val calls = reply.toolCalls
             if (calls.isEmpty()) {
                 return ToolOutcome(text = reply.text, steps = steps, rounds = rounds, reply = reply)
@@ -119,8 +151,12 @@ class ToolLoop(
     companion object {
         private const val TAG = "EternToolLoop"
 
-        /** A model stuck in a loop must not spend the battery. */
-        const val MAX_ROUNDS = 8
+        /**
+         * A generous budget: a real research turn can chain many reads and
+         * searches, so the cap exists to stop a runaway model, not to
+         * interrupt a working one. Cancellation is the user's escape hatch.
+         */
+        const val MAX_ROUNDS = 100
     }
 }
 

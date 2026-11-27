@@ -229,6 +229,17 @@ class LlamaEdgeEngine(
     }
 
     /**
+     * Breaks out of the native decode. [LlamaNative.nativeAbort] is the same
+     * call the cancellation path below already makes; it is safe to make it
+     * while no generation is running.
+     */
+    override fun cancel() {
+        val h = handle
+        if (h != 0L) runCatching { LlamaNative.nativeAbort(h) }
+            .onFailure { Log.w(TAG, "edge abort failed: ${it.message}") }
+    }
+
+    /**
      * Big-core count. A Z Fold 5 has 1x3.0 + 2x2.5 + 2x2.4 + 3x1.8 cores; using every
      * core makes the UI stutter and heats the device, so generation is capped at 6.
      */

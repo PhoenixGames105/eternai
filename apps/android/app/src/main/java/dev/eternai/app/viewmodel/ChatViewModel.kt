@@ -69,6 +69,18 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private val edgeRunner: ToolRunner = EdgeToolRunner(eternApp)
 
     /**
+     * Set while a turn is in flight so [stop] can interrupt the right thing.
+     * Written from the IO thread between generations and read from the main
+     * thread, hence volatile.
+     */
+    @Volatile
+    private var activeEngine: Engine? = null
+
+    /** Latched by [stop]; the tool loop ends at its next safe point. */
+    @Volatile
+    private var stopping = false
+
+    /**
      * Voice I/O lives here rather than in the activity so a rotation does not
      * cut off a reply mid-sentence. The recogniser is main-thread only, hence
      * its own main dispatcher scope instead of `viewModelScope`.
@@ -317,6 +329,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         if (text.isEmpty() || _ui.value.busy) return
 
         val turnId = mintTurnId()
+        stopping = false
+        activeEngine = null
         _ui.update {
             it.copy(
                 busy = true,
@@ -377,12 +391,16 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                     messages,
                     onTool = { result -> appendToolStep(turnId, result) },
                     onChunk = { delta -> appendDelta(turnId, delta) },
+                    onGenerate = { activeEngine = it },
+                    stopRequested = { stopping },
                 )
+                activeEngine = null
 
                 finalize(turnId, text, outcome)
             } catch (e: Exception) {
                 _ui.update { it.copy(notice = describeError("chat failed", e)) }
             } finally {
+                activeEngine = null
                 eternApp.endTurn()
                 val turns = localContext.turns.value
                 val bubbles = contextBubbles(turns)
@@ -399,6 +417,23 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 }
             }
         }
+    }
+
+    /**
+     * Halts the turn in flight.
+     *
+     * Two things have to happen. The engine is interrupted first, because the
+     * turn is actually parked inside a native decode or a socket read that
+     * coroutine cancellation alone would not notice until it returned. Then the
+     * job is left to unwind normally so the partial reply is still recorded to
+     * the context, the outbox and eventually the journal — a stopped turn is
+     * history the user really had, not a turn that never happened.
+     */
+    fun stop() {
+        if (!_ui.value.busy) return
+        stopping = true
+        activeEngine?.cancel()
+        _ui.update { it.copy(notice = "stopping...") }
     }
 
     /**
@@ -732,7 +767,12 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         val reply = outcome.reply
         val seq = runCatching { eternApp.outbox.nextSeq() }.getOrDefault(0L)
         val ts = System.currentTimeMillis()
-        val body = outcome.text.ifEmpty { reply?.error ?: "(no reply)" }
+        val body = outcome.text.ifEmpty {
+            // A stop pressed before the first token streamed left nothing to
+            // keep; say so rather than pretending the model declined to answer.
+            if (outcome.cancelled) "(stopped before answering)"
+            else reply?.error ?: "(no reply)"
+        }
 
         val turn = runCatching {
             newChatTurn(
@@ -766,6 +806,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         _ui.update { state ->
             state.copy(
                 notice = when {
+                    outcome.cancelled -> "stopped after ${outcome.rounds} round(s)"
                     outcome.aborted -> "tool rounds exceeded the limit"
                     reply?.finish == Finish.Error -> reply.error
                     else -> state.notice

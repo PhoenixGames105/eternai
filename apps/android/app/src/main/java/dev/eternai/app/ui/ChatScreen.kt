@@ -76,13 +76,21 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.Canvas
+import androidx.compose.material3.IconButtonDefaults
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.material3.LocalContentColor
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
-import androidx.compose.foundation.gestures.detectTapGestures
-import androidx.compose.ui.input.pointer.pointerInput
 import android.widget.Toast
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -284,11 +292,13 @@ fun ChatScreen(vm: ChatViewModel) {
                             .heightIn(max = 160.dp),
                     )
                     SendButton(
-                        enabled = prompt.isNotBlank() && !ui.busy,
+                        busy = ui.busy,
+                        enabled = prompt.isNotBlank(),
                         onSend = {
                             vm.send(prompt)
                             prompt = ""
                         },
+                        onStop = { vm.stop() },
                     )
                 }
             } else {
@@ -313,11 +323,13 @@ fun ChatScreen(vm: ChatViewModel) {
                                 .heightIn(max = 160.dp),
                         )
                         SendButton(
-                            enabled = prompt.isNotBlank() && !ui.busy,
+                            busy = ui.busy,
+                            enabled = prompt.isNotBlank(),
                             onSend = {
                                 vm.send(prompt)
                                 prompt = ""
                             },
+                            onStop = { vm.stop() },
                         )
                     }
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -480,11 +492,40 @@ private fun VoiceControls(
 }
 
 /**
- * Icon-only send control. A text button costs ~90dp of the ~400dp cover
- * display, which is what left the prompt field unusable.
+ * Icon-only send control, which becomes the stop control while a turn runs.
+ *
+ * A text button costs ~90dp of the ~400dp cover display, which is what left the
+ * prompt field unusable, so the stop affordance reuses the same footprint. The
+ * glyph is drawn rather than taken from `material-icons` because the stop icon
+ * lives in the extended artifact this build does not carry.
  */
 @Composable
-private fun SendButton(enabled: Boolean, onSend: () -> Unit) {
+private fun SendButton(busy: Boolean, enabled: Boolean, onSend: () -> Unit, onStop: () -> Unit) {
+    if (busy) {
+        FilledIconButton(
+            onClick = onStop,
+            colors = IconButtonDefaults.filledIconButtonColors(
+                containerColor = MaterialTheme.colorScheme.errorContainer,
+                contentColor = MaterialTheme.colorScheme.onErrorContainer,
+            ),
+        ) {
+            val tint = LocalContentColor.current
+            Canvas(
+                Modifier
+                    .size(18.dp)
+                    .semantics { contentDescription = "Stop generating" },
+            ) {
+                val side = size.minDimension * 0.62f
+                drawRoundRect(
+                    color = tint,
+                    topLeft = Offset((size.width - side) / 2f, (size.height - side) / 2f),
+                    size = Size(side, side),
+                    cornerRadius = CornerRadius(side * 0.18f),
+                )
+            }
+        }
+        return
+    }
     FilledIconButton(onClick = onSend, enabled = enabled) {
         Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Send")
     }

@@ -189,6 +189,8 @@ function addBubble(cls: string, text: string): HTMLElement {
 
 let streaming = false;
 let sending = false;
+/** Id of the turn in flight, so the Stop button can cancel exactly that one. */
+let activeTurnId: string | null = null;
 let refreshingHistory = false;
 let historySyncError = "";
 let lastHistorySnapshot: string | null = null;
@@ -227,12 +229,34 @@ function stepLabel(ev: ToolEvent): string {
   return ev.ok ? did : `${did} failed`;
 }
 
+/**
+ * The send control doubles as the stop control while a turn is running.
+ *
+ * It stays a `type="submit"` button rather than being disabled, so the form's
+ * submit handler can intercept the second press as a stop instead of the click
+ * doing nothing.
+ */
+function renderSendButton() {
+  chatSend.textContent = sending ? "Stop" : "Send";
+  chatSend.classList.toggle("stop", sending);
+  chatSend.title = sending ? "Stop this reply" : "Send";
+}
+
+function stopChat() {
+  if (!sending || !activeTurnId) return;
+  addBubble("msg-notice", "Stopping…");
+  void invoke("chat_cancel", { id: activeTurnId }).catch((err) =>
+    addBubble("msg-error", String(err)),
+  );
+}
+
 async function sendChat(text: string) {
   if (streaming || sending) return;
   const id = crypto.randomUUID();
   streaming = true;
   sending = true;
-  chatSend.disabled = true;
+  activeTurnId = id;
+  renderSendButton();
 
   const pendingMessages: ChatMessage[] = [{ role: "user", content: text }];
   pendingTurns.set(id, pendingMessages);
@@ -301,7 +325,8 @@ async function sendChat(text: string) {
     done();
     streaming = false;
     sending = false;
-    chatSend.disabled = false;
+    activeTurnId = null;
+    renderSendButton();
     chatInput.focus();
     await refreshChatHistory();
   } catch (err) {
@@ -309,7 +334,8 @@ async function sendChat(text: string) {
     done();
     streaming = false;
     sending = false;
-    chatSend.disabled = false;
+    activeTurnId = null;
+    renderSendButton();
     chatInput.focus();
     await refreshChatHistory();
   }
@@ -387,7 +413,12 @@ async function refreshChatHistory() {
 
 chatForm.addEventListener("submit", (e) => {
   e.preventDefault();
-  if (streaming || sending) return;
+  // While a turn runs the button reads "Stop", so the same press cancels it
+  // rather than queueing a second prompt.
+  if (streaming || sending) {
+    stopChat();
+    return;
+  }
   const text = chatInput.value.trim();
   if (!text) return;
   chatInput.value = "";

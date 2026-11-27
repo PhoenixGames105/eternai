@@ -115,6 +115,25 @@ class ServerEdgeEngine(
             .build()
     }
 
+    /**
+     * The in-flight loopback request, so [cancel] can hang it up.
+     *
+     * llama.cpp's server has no per-request cancel endpoint, but it does poll
+     * for a closed connection between tokens, so closing the socket both stops
+     * the read immediately and lets the decode finish early.
+     */
+    @Volatile
+    private var activeCall: okhttp3.Call? = null
+
+    /**
+     * Latched by [cancel] so the socket error it provokes is reported as a stop
+     * rather than a fault. OkHttp words that error differently per protocol
+     * version ("Canceled", "stream was reset: CANCEL", "Socket closed"), so it
+     * cannot be recognised from the message.
+     */
+    @Volatile
+    private var cancelledByUser = false
+
     private val json = "application/json; charset=utf-8".toMediaType()
 
     val modelFile: File?
@@ -371,6 +390,7 @@ class ServerEdgeEngine(
 
         val text = StringBuilder()
         val calls = ToolCallAccumulator()
+        cancelledByUser = false
         return try {
             withContext(Dispatchers.IO) {
                 val request = Request.Builder()
@@ -378,45 +398,63 @@ class ServerEdgeEngine(
                     .header("accept", "text/event-stream")
                     .post(body.toString().toRequestBody(json))
                     .build()
-                client.newCall(request).execute().use { resp ->
-                    if (!resp.isSuccessful) {
-                        return@withContext Reply(
-                            "", Finish.Error, name, model, "server HTTP ${resp.code}",
-                        )
-                    }
-                    val source = resp.body?.source()
-                        ?: return@withContext Reply("", Finish.Error, name, model, "no body")
-                    while (true) {
-                        val line = source.readUtf8Line() ?: break
-                        if (!line.startsWith("data:")) continue
-                        val payload = line.substring(5).trim()
-                        if (payload.isEmpty()) continue
-                        if (payload == "[DONE]") break
-                        val choice = JSONObject(payload).optJSONArray("choices")?.optJSONObject(0)
-                            ?: continue
-                        val delta = choice.optJSONObject("delta")
-                        delta?.optStringOrNull("content")?.takeIf { it.isNotEmpty() }?.let {
-                            text.append(it)
-                            onChunk(Chunk(it))
+                val call = client.newCall(request)
+                activeCall = call
+                try {
+                    call.execute().use { resp ->
+                        if (!resp.isSuccessful) {
+                            return@use Reply(
+                                "", Finish.Error, name, model, "server HTTP ${resp.code}",
+                            )
                         }
-                        delta?.let { calls.absorb(it) }
+                        val source = resp.body?.source()
+                            ?: return@use Reply("", Finish.Error, name, model, "no body")
+                        while (true) {
+                            val line = source.readUtf8Line() ?: break
+                            if (!line.startsWith("data:")) continue
+                            val payload = line.substring(5).trim()
+                            if (payload.isEmpty()) continue
+                            if (payload == "[DONE]") break
+                            val choice = JSONObject(payload).optJSONArray("choices")?.optJSONObject(0)
+                                ?: continue
+                            val delta = choice.optJSONObject("delta")
+                            delta?.optStringOrNull("content")?.takeIf { it.isNotEmpty() }?.let {
+                                text.append(it)
+                                onChunk(Chunk(it))
+                            }
+                            delta?.let { calls.absorb(it) }
+                        }
                     }
+                } finally {
+                    activeCall = null
                 }
             }
             coroutineContext.ensureActive()
             Reply(text.toString(), Finish.Stop, name, model, toolCalls = calls.result())
         } catch (e: CancellationException) {
-            // The server keeps decoding; a fresh turn supersedes it. Interrupting
-            // mid-request would need a cancel endpoint the loopback server does
-            // not expose per-request, so just report the cancellation upward.
+            // Closing the socket above is what makes this arrive promptly; the
+            // server notices the dropped connection and stops decoding.
             Reply(text.toString(), Finish.Cancelled, name, model)
         } catch (e: java.io.IOException) {
-            Log.w(TAG, "server stream broke: ${e.message}")
-            Reply(text.toString(), Finish.Error, name, model, "loopback: ${e.message}")
+            // A call [cancel] hung up surfaces here too; that is a stop, not a fault.
+            if (cancelledByUser) {
+                Reply(text.toString(), Finish.Cancelled, name, model)
+            } else {
+                Log.w(TAG, "server stream broke: ${e.message}")
+                Reply(text.toString(), Finish.Error, name, model, "loopback: ${e.message}")
+            }
         } catch (e: org.json.JSONException) {
             Log.w(TAG, "server sent a non-JSON chunk: ${e.message}")
             Reply(text.toString(), Finish.Error, name, model, "malformed stream: ${e.message}")
         }
+    }
+
+    /**
+     * Hangs up the in-flight loopback request. Safe when nothing is running.
+     */
+    override fun cancel() {
+        cancelledByUser = true
+        activeCall?.cancel()
     }
 
     private fun countPromptTokens(messages: List<MessageDto>, tools: JSONArray?): Int {

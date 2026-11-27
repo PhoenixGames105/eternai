@@ -50,4 +50,17 @@ interface Engine {
         tools: JSONArray? = null,
         onChunk: (Chunk) -> Unit,
     ): Reply
+
+    /**
+     * Interrupts the generation this engine is running right now, if any.
+     *
+     * Called from the UI thread while the user watches a reply stream, so it
+     * must be cheap and must never block. Coroutine cancellation alone is not
+     * enough: [generate] spends its time inside a blocking native decode or a
+     * blocking socket read, neither of which notices cancellation until it
+     * returns, so each engine has to break out of its own wait. Engines that
+     * cannot interrupt a decode leave this as a no-op and the turn ends when
+     * the current generation finishes on its own.
+     */
+    fun cancel() = Unit
 }

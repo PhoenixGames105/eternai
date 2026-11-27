@@ -4,7 +4,7 @@
 //! a real socket: SSE framing, the native-vs-text decision, the batch execute
 //! round trip, and what actually ends up in the transcript we journal.
 
-use etern_desktop_lib::tool_loop::{self, Sink};
+use etern_desktop_lib::tool_loop::{self, CancelFlag, Sink};
 use etern_desktop_lib::{recordable_turn, ChatMessage, Conn};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -74,6 +74,8 @@ enum Script {
     Endless,
     /// Prose that merely contains braces.
     PlainProse,
+    /// Prose that trickles forever, so a stop can interrupt it mid-stream.
+    SlowProse,
 }
 
 /// A stand-in for the gateway: real socket, real SSE, no model.
@@ -248,6 +250,7 @@ fn sse(mut stream: TcpStream, script: Script, turn: usize) -> std::io::Result<()
                 "arguments":"{\"path\":\"inbox/a.md\"}"}}]}}]}))],
         (Script::PlainProse, _) => vec![chunk(&json!({"choices":[{"delta":{"content":
             "Braces { like this } are not tool calls."}}]}))],
+        (Script::SlowProse, _) => vec![],
         _ => vec![chunk(&json!({"choices":[{"delta":{"content":"Your note says hello."}}]}))],
     };
 
@@ -255,6 +258,22 @@ fn sse(mut stream: TcpStream, script: Script, turn: usize) -> std::io::Result<()
         stream,
         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"
     )?;
+    if script == Script::SlowProse {
+        // Trickles tokens forever. The test's stop has to cut this short, so
+        // the mock keeps writing until the client hangs the connection up and
+        // the write fails.
+        for word in ["the ", "quick ", "brown ", "fox ", "jumps ", "over "]
+            .iter()
+            .cycle()
+            .take(5_000)
+        {
+            let piece = chunk(&json!({"choices":[{"delta":{"content":word}}]}));
+            stream.write_all(piece.as_bytes())?;
+            stream.flush()?;
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        return Ok(());
+    }
     for c in chunks {
         write!(stream, "{c}")?;
     }
@@ -308,6 +327,7 @@ async fn native_tool_call_round_trips_and_is_journaled() {
         &json!({"model": "test"}),
         "turn-1",
         "",
+        &CancelFlag::default(),
     )
     .await
     .expect("loop completes");
@@ -367,6 +387,7 @@ async fn text_protocol_is_used_when_the_template_cannot_carry_tools() {
         &json!({}),
         "turn-2",
         "warm and concise",
+        &CancelFlag::default(),
     )
         .await
         .expect("loop completes");
@@ -413,21 +434,86 @@ async fn an_endless_model_hits_the_round_budget_and_says_so() {
     let gateway = MockGateway::start(Script::Endless, true, true);
     let recorder = Recorder::default();
 
-    let outcome = tool_loop::run(&recorder, &gateway.conn(), prompt(), &json!({}), "turn-3", "")
+    let outcome = tool_loop::run(&recorder, &gateway.conn(), prompt(), &json!({}), "turn-3", "", &CancelFlag::default())
         .await
         .expect("loop stops itself");
 
     assert!(outcome.aborted);
+    assert!(!outcome.cancelled);
     assert_eq!(
         outcome.reply,
-        "I stopped after 8 tool rounds without reaching an answer."
+        format!("I stopped after {} tool rounds without reaching an answer.", tool_loop::MAX_ROUNDS)
     );
     assert_eq!(
         gateway.generations.load(Ordering::SeqCst),
         tool_loop::MAX_ROUNDS
     );
     assert_eq!(recorder.tools().len(), tool_loop::MAX_ROUNDS);
-    assert!(recorder.notices().contains("exhausted after 8 tool calls"));
+    assert!(recorder
+        .notices()
+        .contains(&format!("exhausted after {} tool calls", tool_loop::MAX_ROUNDS)));
+}
+
+#[tokio::test]
+async fn a_stopped_turn_keeps_the_partial_reply_and_stops_reading() {
+    // The engine streams prose forever; the user stops after the first chunk.
+    let gateway = MockGateway::start(Script::SlowProse, true, true);
+    let recorder = Recorder::default();
+    let cancel = CancelFlag::default();
+
+    let flag = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        flag.cancel();
+    });
+
+    let outcome = tool_loop::run(
+        &recorder,
+        &gateway.conn(),
+        prompt(),
+        &json!({}),
+        "turn-5",
+        "",
+        &cancel,
+    )
+    .await
+    .expect("stop ends the turn");
+
+    assert!(outcome.cancelled);
+    assert!(!outcome.aborted);
+    // Some, but emphatically not all, of the reply reached the screen.
+    let streamed = recorder.deltas();
+    assert!(!streamed.is_empty(), "the partial reply is what the user got");
+    assert!(
+        streamed.len() < "the quick brown fox ".repeat(50).len(),
+        "reading stopped instead of draining the stream"
+    );
+    assert_eq!(streamed, outcome.reply);
+
+    // A stopped turn is still history: the journal record needs the question
+    // and the partial answer, or the day looks like it never happened.
+    let record = recordable_turn("turn-5", &outcome.exchange).expect("stopped turn is journalable");
+    let messages = record["messages"].as_array().unwrap();
+    assert_eq!(messages[0]["role"], "user");
+    assert_eq!(messages.last().unwrap()["role"], "assistant");
+    assert_eq!(messages.last().unwrap()["content"], streamed);
+}
+
+#[tokio::test]
+async fn a_stop_before_the_first_round_ends_the_turn_without_generating() {
+    let gateway = MockGateway::start(Script::PlainProse, true, true);
+    let recorder = Recorder::default();
+    let cancel = CancelFlag::default();
+    cancel.cancel();
+
+    let outcome = tool_loop::run(&recorder, &gateway.conn(), prompt(), &json!({}), "turn-6", "", &cancel)
+        .await
+        .expect("a pre-set stop ends immediately");
+
+    assert!(outcome.cancelled);
+    assert_eq!(outcome.reply, "");
+    assert_eq!(gateway.generations.load(Ordering::SeqCst), 0);
+    assert!(recorder.deltas().is_empty());
 }
 
 #[tokio::test]
@@ -437,7 +523,7 @@ async fn a_gateway_without_tools_stays_a_plain_chat() {
     let gateway = MockGateway::start(Script::PlainProse, true, false);
     let recorder = Recorder::default();
 
-    let outcome = tool_loop::run(&recorder, &gateway.conn(), prompt(), &json!({}), "turn-4", "")
+    let outcome = tool_loop::run(&recorder, &gateway.conn(), prompt(), &json!({}), "turn-4", "", &CancelFlag::default())
         .await
         .expect("plain chat completes");
 

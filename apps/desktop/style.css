@@ -238,10 +238,19 @@ button {
   font-weight: 600;
   cursor: pointer;
   font-size: 13px;
+  /* "Send" and "Stop" differ in width; holding the box steady stops the input
+     row from twitching every time a turn starts or ends. */
+  min-width: 74px;
 }
 
 button:hover {
   filter: brightness(1.1);
+}
+
+/* The same control while a turn runs: pressing it halts the reply. */
+button.stop {
+  background: var(--err);
+  color: #0b0e14;
 }
 
 button:disabled {
