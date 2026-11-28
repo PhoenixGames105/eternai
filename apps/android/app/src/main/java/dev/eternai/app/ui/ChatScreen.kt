@@ -13,6 +13,8 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -227,10 +229,14 @@ fun ChatScreen(vm: ChatViewModel) {
 
             val listState = rememberLazyListState()
             val bubbles = ui.bubbles
+            // The turn's tool group is seeded before the first token so the list never
+            // grows mid-turn, which means the bubble that actually grows is the reply
+            // itself — that is what auto-scroll has to follow, not the last row.
+            val streaming = bubbles.lastOrNull { it.streaming }
             StickToBottom(
                 listState = listState,
                 bubbleCount = bubbles.size,
-                lastTextLength = bubbles.lastOrNull()?.text?.length ?: 0,
+                lastTextLength = streaming?.text?.length ?: 0,
                 busy = ui.busy,
                 keyboardHeight = keyboardHeight,
             )
@@ -250,10 +256,16 @@ fun ChatScreen(vm: ChatViewModel) {
                         verticalArrangement = Arrangement.spacedBy(8.dp),
                         modifier = Modifier.fillMaxSize(),
                     ) {
+                        // While a turn streams, its user and assistant bubbles both
+                        // carry the bare turn id, so the role is part of the key.
                         items(bubbles, key = { it.id + it.role }) { bubble ->
                             BubbleRow(bubble, onDelete = { vm.deleteBubble(bubble.id) })
                         }
-                        if (ui.busy && bubbles.lastOrNull()?.role != "assistant") {
+                        // The turn's tool group is seeded before the first token so the
+                        // list does not grow mid-turn; only a group with steps, or a
+                        // reply that has not started, counts as the tail of the turn.
+                        val tail = bubbles.lastOrNull { it.role != "tools" || it.steps.isNotEmpty() }
+                        if (ui.busy && tail?.role != "assistant") {
                             item {
                                 Row(verticalAlignment = Alignment.CenterVertically) {
                                     CircularProgressIndicator(Modifier.height(16.dp).widthIn(max = 16.dp))
@@ -899,6 +911,98 @@ private fun ModelSheet(vm: ChatViewModel) {
     }
 }
 
+/** Everything in a tool group, as the clipboard sees it. */
+private fun toolGroupText(steps: List<ChatViewModel.ToolStep>): String =
+    steps.joinToString("\n") { step ->
+        if (step.detail.isEmpty()) step.label else step.label + ": " + step.detail
+    }
+
+/**
+ * A run of tool calls folded into one bubble.
+ *
+ * Ten chips down the side of the cover display used to push the reply itself off
+ * screen, so the group stays a single line until it is tapped open. The header
+ * keeps the count, any failures, and the most recent step, which is all the
+ * feedback a streaming turn needs.
+ */
+@Composable
+private fun ToolGroupCard(bubble: ChatViewModel.Bubble, onLongPress: () -> Unit) {
+    var expanded by rememberSaveable(bubble.id) { mutableStateOf(false) }
+    val count = bubble.steps.size
+    val failed = bubble.steps.count { it.failed }
+    val header = buildString {
+        append(if (count == 1) "1 tool call" else "$count tool calls")
+        append(
+            when (failed) {
+                0 -> ""
+                1 -> " · 1 failed"
+                else -> " · $failed failed"
+            },
+        )
+        if (!expanded) bubble.steps.lastOrNull()?.let { append(" · " + it.label) }
+    }
+
+    Card(
+        shape = RoundedCornerShape(14.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+        border = BorderStroke(
+            1.dp,
+            if (failed > 0) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.outlineVariant,
+        ),
+        modifier = Modifier
+            .widthIn(max = 520.dp)
+            .pointerInput(bubble.id) {
+                // One detector owns both gestures; a `clickable` child would fight
+                // the long-press that opens the copy/delete menu.
+                detectTapGestures(
+                    onTap = { expanded = !expanded },
+                    onLongPress = { onLongPress() },
+                )
+            },
+    ) {
+        Column(Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    header,
+                    style = MaterialTheme.typography.labelLarge,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    color = if (failed > 0) MaterialTheme.colorScheme.error
+                    else MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.weight(1f),
+                )
+                Icon(
+                    if (expanded) Icons.Filled.KeyboardArrowUp else Icons.Filled.KeyboardArrowDown,
+                    contentDescription = if (expanded) "Collapse tool calls" else "Expand tool calls",
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            if (expanded) {
+                bubble.steps.forEachIndexed { index, step ->
+                    Column(Modifier.padding(top = if (index == 0) 10.dp else 8.dp)) {
+                        Text(
+                            step.label,
+                            style = MaterialTheme.typography.labelMedium,
+                            color = if (step.failed) MaterialTheme.colorScheme.error
+                            else MaterialTheme.colorScheme.onSurface,
+                        )
+                        if (step.detail.isNotEmpty()) {
+                            Text(
+                                step.detail,
+                                style = MaterialTheme.typography.bodySmall
+                                    .copy(fontFamily = FontFamily.Monospace),
+                                maxLines = 6,
+                                overflow = TextOverflow.Ellipsis,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 @Composable
 private fun BubbleRow(bubble: ChatViewModel.Bubble, onDelete: () -> Unit) {
     // Long-press opens a small menu. Copy alone used to be the whole gesture, but
@@ -909,42 +1013,14 @@ private fun BubbleRow(bubble: ChatViewModel.Bubble, onDelete: () -> Unit) {
     var menuOpen by remember(bubble.id) { mutableStateOf(false) }
     var confirmDelete by remember(bubble.id) { mutableStateOf(false) }
     val deletable = !bubble.streaming
-    val copyable = bubble.role != "tool" && bubble.text.isNotBlank() && !bubble.streaming
+    val copyText = if (bubble.role == "tools") toolGroupText(bubble.steps) else bubble.text
+    val copyable = copyText.isNotBlank() && deletable
     val menuModifier = if (deletable) {
         Modifier.pointerInput(bubble.id) {
             detectTapGestures(onLongPress = { menuOpen = true })
         }
     } else {
         Modifier
-    }
-
-    if (bubble.role == "tool") {
-        val color = if (bubble.failed) {
-            MaterialTheme.colorScheme.error
-        } else {
-            MaterialTheme.colorScheme.outlineVariant
-        }
-        Row(
-            Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.Start,
-        ) {
-            Card(
-                shape = RoundedCornerShape(50),
-                colors = CardDefaults.cardColors(
-                    containerColor = MaterialTheme.colorScheme.surfaceVariant,
-                ),
-                border = BorderStroke(1.dp, color),
-            ) {
-                Text(
-                    bubble.text,
-                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
-                    style = MaterialTheme.typography.labelMedium,
-                    color = if (bubble.failed) MaterialTheme.colorScheme.error
-                    else MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-        }
-        return
     }
 
     val fromUser = bubble.role == "user"
@@ -955,25 +1031,29 @@ private fun BubbleRow(bubble: ChatViewModel.Bubble, onDelete: () -> Unit) {
         // The menu is anchored to the bubble itself so it drops where the finger
         // was, rather than at the far edge of the row.
         Box {
-            Card(
-                shape = RoundedCornerShape(14.dp),
-                colors = CardDefaults.cardColors(
-                    containerColor = if (fromUser) {
-                        MaterialTheme.colorScheme.primary
-                    } else {
-                        MaterialTheme.colorScheme.surfaceVariant
-                    },
-                ),
-                modifier = Modifier.widthIn(max = 520.dp).then(menuModifier),
-            ) {
-                Column(Modifier.padding(12.dp)) {
-                    if (!fromUser) {
-                        Text(
-                            bubble.text.ifEmpty { if (bubble.streaming) "..." else "" },
-                            style = MaterialTheme.typography.bodyMedium,
-                        )
-                    } else {
-                        Text(bubble.text, style = MaterialTheme.typography.bodyMedium)
+            if (bubble.role == "tools") {
+                ToolGroupCard(bubble, onLongPress = { if (deletable) menuOpen = true })
+            } else {
+                Card(
+                    shape = RoundedCornerShape(14.dp),
+                    colors = CardDefaults.cardColors(
+                        containerColor = if (fromUser) {
+                            MaterialTheme.colorScheme.primary
+                        } else {
+                            MaterialTheme.colorScheme.surfaceVariant
+                        },
+                    ),
+                    modifier = Modifier.widthIn(max = 520.dp).then(menuModifier),
+                ) {
+                    Column(Modifier.padding(12.dp)) {
+                        if (!fromUser) {
+                            Text(
+                                bubble.text.ifEmpty { if (bubble.streaming) "..." else "" },
+                                style = MaterialTheme.typography.bodyMedium,
+                            )
+                        } else {
+                            Text(bubble.text, style = MaterialTheme.typography.bodyMedium)
+                        }
                     }
                 }
             }
@@ -983,7 +1063,7 @@ private fun BubbleRow(bubble: ChatViewModel.Bubble, onDelete: () -> Unit) {
                     enabled = copyable,
                     onClick = {
                         menuOpen = false
-                        clipboard.setText(AnnotatedString(bubble.text))
+                        clipboard.setText(AnnotatedString(copyText))
                         Toast.makeText(context, "copied to clipboard", Toast.LENGTH_SHORT).show()
                     },
                 )

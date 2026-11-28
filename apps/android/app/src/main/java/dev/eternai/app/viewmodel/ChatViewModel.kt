@@ -146,6 +146,19 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         val text: String,
         val streaming: Boolean = false,
         val failed: Boolean = false,
+        /** Tool calls behind a [TOOL_GROUP] bubble, in the order they ran. */
+        val steps: List<ToolStep> = emptyList(),
+    )
+
+    /**
+     * One tool call as the collapsed group shows it: a human label, and enough
+     * of the payload to be worth expanding for.
+     */
+    data class ToolStep(
+        val name: String,
+        val label: String,
+        val detail: String,
+        val failed: Boolean,
     )
 
     /** One GGUF the user has copied into the app's model directory. */
@@ -332,11 +345,15 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         stopping = false
         activeEngine = null
         _ui.update {
+            // The tool group is seeded up front, directly under the reply it belongs
+            // to: adding it mid-turn would change the bubble count and make the list
+            // jump while the user is reading the answer stream by.
             it.copy(
                 busy = true,
                 bubbles = it.bubbles +
                     Bubble(turnId, "user", text) +
-                    Bubble(turnId, "assistant", "", streaming = true),
+                    Bubble(turnId, "assistant", "", streaming = true) +
+                    Bubble(toolGroupId(turnId), ROLE_TOOLS, ""),
             )
         }
 
@@ -408,8 +425,9 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                     bubbles
                 } else {
                     val pending = _ui.value.bubbles
-                        .filter { it.id == turnId || it.id.startsWith("$turnId:tool:") }
+                        .filter { it.id == turnId || it.role == ROLE_TOOLS && it.id.startsWith(turnId) }
                         .map { if (it.role == "assistant") it.copy(streaming = false) else it }
+                        .filterNot { it.role == ROLE_TOOLS && it.steps.isEmpty() }
                     bubbles + pending
                 }
                 _ui.update {
@@ -751,59 +769,26 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /**
+     * Adds one tool result to the turn's single tool bubble.
+     *
+     * A turn that reaches for ten tools used to paint ten chips down the side of the
+     * screen, which on the Fold's cover display pushed the actual reply off it. The
+     * steps collect into one bubble the user can open when they want the detail.
+     */
     private fun appendToolStep(turnId: String, result: dev.eternai.app.tools.ToolResult) {
-        val label = toolLabel(result.name, result.ok)
-
+        val step = ToolStep(
+            name = result.name,
+            label = toolLabel(result.name, result.ok),
+            detail = toolDetail(result.payload),
+            failed = !result.ok,
+        )
         _ui.update { state ->
-            val sequence = state.bubbles.count { it.id.startsWith("$turnId:tool:") }
-            state.copy(
-                bubbles = state.bubbles + Bubble(
-                    id = "$turnId:tool:$sequence",
-                    role = "tool",
-                    text = label,
-                    failed = !result.ok,
-                ),
-            )
+            state.copy(bubbles = appendToolStep(state.bubbles, turnId, step))
         }
     }
 
-    private fun contextBubbles(turns: List<ConversationTurn>): List<Bubble> = buildList {
-        turns.forEach { turn ->
-            turn.messages.forEachIndexed { index, message ->
-                when (message.role) {
-                    "user" -> add(Bubble("${turn.turnId}:$index", "user", message.content))
-                    "assistant" -> if (message.content.isNotBlank()) {
-                        add(Bubble("${turn.turnId}:$index", "assistant", message.content))
-                    }
-                    "tool" -> {
-                        val failed = Regex("\"ok\"\\s*:\\s*false").containsMatchIn(message.content)
-                        add(
-                            Bubble(
-                                "${turn.turnId}:$index",
-                                "tool",
-                                toolLabel(message.name ?: "tool", !failed),
-                                failed = failed,
-                            ),
-                        )
-                    }
-                }
-            }
-        }
-    }
-
-    private fun toolLabel(name: String, ok: Boolean): String {
-        val action = when (name) {
-            "read_file" -> "read a file"
-            "write_file" -> "wrote a file"
-            "list_dir" -> "listed a folder"
-            "web_search" -> "searched the web"
-            "remember" -> "saved a memory"
-            "recall" -> "searched memories"
-            "journal_read" -> "read the journal"
-            else -> "used $name"
-        }
-        return if (ok) action else "$action failed"
-    }
+    internal fun contextBubbles(turns: List<ConversationTurn>): List<Bubble> = projectBubbles(turns)
 
     /**
      * Records the exchange in the live context and the durable outbox.
@@ -930,4 +915,148 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun describeError(what: String, e: Throwable): String =
         what + ": " + (if (e is EternException) e.message else e.message ?: e.toString())
+}
+
+/** Role for the single bubble that holds a turn's tool calls. */
+internal const val ROLE_TOOLS = "tools"
+
+/** Longest tool payload shown in the expanded group. */
+private const val MAX_DETAIL_CHARS = 240
+
+/** Id of the one tool bubble a turn owns; the turn id stays the prefix. */
+internal fun toolGroupId(turnId: String): String = "$turnId:tools"
+
+/**
+ * Projects stored turns into chat bubbles.
+ *
+ * Everything the model did with tools in an exchange folds into a single bubble,
+ * which is what the live turn shows while it streams, so a turn looks the same
+ * before and after it is reloaded from disk.
+ */
+internal fun projectBubbles(turns: List<ConversationTurn>): List<ChatViewModel.Bubble> = buildList {
+    turns.forEach { turn ->
+        val steps = mutableListOf<ChatViewModel.ToolStep>()
+
+        turn.messages.forEachIndexed { index, message ->
+            when (message.role) {
+                "user" -> add(ChatViewModel.Bubble("${turn.turnId}:$index", "user", message.content))
+                "assistant" -> if (message.content.isNotBlank()) {
+                    add(ChatViewModel.Bubble("${turn.turnId}:$index", "assistant", message.content))
+                }
+                "tool" -> {
+                    val failed = Regex("\"ok\"\\s*:\\s*false").containsMatchIn(message.content)
+                    steps += ChatViewModel.ToolStep(
+                        name = message.name ?: "tool",
+                        label = toolLabel(message.name ?: "tool", !failed),
+                        detail = toolDetail(message.content),
+                        failed = failed,
+                    )
+                }
+            }
+        }
+
+        if (steps.isNotEmpty()) {
+            add(ChatViewModel.Bubble(toolGroupId(turn.turnId), ROLE_TOOLS, "", steps = steps))
+        }
+    }
+}
+
+/**
+ * Folds a tool result into the turn's group, creating it on the first call.
+ *
+ * The group's id never changes, so the list keeps its position and its key while
+ * steps are appended underneath the streaming reply.
+ */
+internal fun appendToolStep(
+    bubbles: List<ChatViewModel.Bubble>,
+    turnId: String,
+    step: ChatViewModel.ToolStep,
+): List<ChatViewModel.Bubble> {
+    val id = toolGroupId(turnId)
+    val index = bubbles.indexOfFirst { it.id == id }
+    if (index < 0) {
+        return bubbles + ChatViewModel.Bubble(id, ROLE_TOOLS, "", steps = listOf(step))
+    }
+    return bubbles.toMutableList().also { list ->
+        list[index] = list[index].let { it.copy(steps = it.steps + step) }
+    }
+}
+
+/**
+ * One-line summary of a tool result for the expanded view.
+ *
+ * The payloads are what the model sees, and several of them carry a whole file or
+ * web page under `content`/`text`. Showing that verbatim would be a wall of JSON,
+ * so the bulk fields are dropped and what is left is flattened: arrays collapse to
+ * their contents or a count, and a failure reads from its `error` object.
+ */
+internal fun toolDetail(payload: String): String {
+    val envelope = runCatching { org.json.JSONObject(payload) }.getOrNull() ?: return truncateDetail(payload)
+    if (!envelope.optBoolean("ok", true)) {
+        // A failure carries `{"ok":false,"retryable":...,"error":{"kind":...,"message":...}}`.
+        // The message is the only part worth reading; the rest is for the gateway.
+        val message = (envelope.opt("error") as? org.json.JSONObject)?.optString("message")
+            ?.ifBlank { null } ?: envelope.optString("message").ifBlank { null }
+        if (message != null) return truncateDetail(message)
+        val error = envelope.opt("error")
+        if (error != null && error != org.json.JSONObject.NULL) {
+            return truncateDetail(summarise(error, "error") ?: payload)
+        }
+    }
+    // JSONObject has no defined key order, so order explicitly: the fields that
+    // identify what was touched come first, the rest follow alphabetically.
+    val parts = orderedKeys(envelope).mapNotNull { key ->
+        if (key in DETAIL_SKIP_KEYS) null else summarise(envelope.opt(key), key)
+    }
+    return truncateDetail(parts.joinToString(" · "))
+}
+
+/** Fields worth leading with, in the order they read best. */
+private val DETAIL_KEY_ORDER = listOf("path", "url", "query", "kind", "message", "status", "chars", "entries", "results", "count")
+
+private fun orderedKeys(obj: org.json.JSONObject): List<String> {
+    val present = buildList { obj.keys().forEach { add(it) } }
+    val leading = DETAIL_KEY_ORDER.filter(present::contains)
+    return leading + (present - leading.toSet()).sorted()
+}
+
+/** Fields that hold the body of a result rather than a description of it. */
+private val DETAIL_SKIP_KEYS = setOf("ok", "retryable", "content", "text", "snippet", "body")
+
+private fun summarise(value: Any?, key: String): String? = when (value) {
+    null, org.json.JSONObject.NULL -> null
+    is org.json.JSONArray -> {
+        val names = (0 until value.length()).mapNotNull { value.opt(it) as? String }
+        when {
+            names.size == value.length() && names.joinToString(", ").length <= 120 ->
+                "$key: " + names.joinToString(", ")
+            else -> "$key: ${value.length()}"
+        }
+    }
+    is org.json.JSONObject -> orderedKeys(value)
+        .filterNot { it in DETAIL_SKIP_KEYS }
+        .mapNotNull { summarise(value.opt(it), it) }
+        .joinToString(" · ")
+        .ifEmpty { null }
+    is Boolean -> if (value) "$key: true" else null
+    is String -> if (value.isEmpty() || value == "ok") null else "$key: $value"
+    else -> "$key: $value"
+}
+
+private fun truncateDetail(body: String): String =
+    if (body.length > MAX_DETAIL_CHARS) body.take(MAX_DETAIL_CHARS) + "…" else body
+
+internal fun toolLabel(name: String, ok: Boolean): String {
+    val action = when (name) {
+        "read_file" -> "read a file"
+        "write_file" -> "wrote a file"
+        "list_dir" -> "listed a folder"
+        "fetch_page" -> "fetched a page"
+        "web_search" -> "searched the web"
+        "remember" -> "saved a memory"
+        "recall" -> "searched memories"
+        "journal_read" -> "read the journal"
+        else -> "used $name"
+    }
+    return if (ok) action else "$action failed"
 }
