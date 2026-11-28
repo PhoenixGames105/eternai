@@ -16,6 +16,9 @@
 //!     desktop's canonical `MEMORY.md` and return the merged file.
 //!   * `POST /etern/personality/sync` — reconcile the editable shared
 //!     style preference and return the gateway's canonical value.
+//!   * `POST /etern/history/clear` and `POST /etern/history/turn/delete` —
+//!     purge the whole transcript or one exchange, scoped so a device can only
+//!     touch its own turns.
 //!
 //! The push handler is deliberately ordered: validate, insert, then summarise.
 //! A crash between insert and journal write loses nothing — the turns are
@@ -541,9 +544,107 @@ async fn clear_history(
     Json(json!({ "cleared": cleared })).into_response()
 }
 
+/// Body of `POST /etern/history/turn/delete`.
+///
+/// No `confirm` flag is demanded the way [`ClearRequest`] does: the payload is
+/// a UUIDv7 the caller has to already know, so a stray `curl` cannot wipe
+/// anything by accident, and the edge app confirms with the user first.
+#[derive(Debug, Deserialize)]
+pub struct DeleteTurnRequest {
+    pub turn_id: String,
+}
+
+/// `POST /etern/history/turn/delete` — purge one exchange from the desktop store.
+///
+/// The exchange (prompt, reply, tool steps) is the unit because that is what
+/// the store and the sync protocol both key on; deleting a single message row
+/// would leave tool calls answered by nothing, which the chat template rejects.
+///
+/// Scoping mirrors [`clear_history`]: [`auth::check_any`] also admits paired
+/// device tokens, so a device may only delete turns it created. Without this
+/// endpoint a deletion on the phone would be silently undone by the next window
+/// or transcript pull, which are both built from the desktop's database.
+/// What the blocking delete attempt found.
+enum DeleteTurn {
+    /// No such turn — treated as success by callers that only care that the
+    /// desktop does not hold it.
+    Missing,
+    /// The turn belongs to a different device.
+    Forbidden,
+    Deleted(u64),
+}
+
+async fn delete_turn(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Result<Json<DeleteTurnRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let outcome = match auth::check_any(&state.cfg, &state.store, &headers) {
+        Ok(outcome) => outcome,
+        Err(err) => return err.into(),
+    };
+
+    let axum::Json(req) = match body {
+        Ok(b) => b,
+        Err(e) => return error(StatusCode::BAD_REQUEST, e),
+    };
+    let turn_id = req.turn_id.trim().to_string();
+    if turn_id.is_empty() {
+        return error(StatusCode::BAD_REQUEST, "turn_id is required");
+    }
+
+    let store = state.store.clone();
+    let owner = matches!(outcome, auth::AuthOutcome::Owner);
+    let device_id = match &outcome {
+        auth::AuthOutcome::Device(record) => Some(record.id.clone()),
+        auth::AuthOutcome::Owner => None,
+    };
+
+    let result = tokio::task::spawn_blocking({
+        let device_id = device_id.clone();
+        let turn_id = turn_id.clone();
+        move || match store.turn_by_id(&turn_id) {
+            Ok(None) => Ok(DeleteTurn::Missing),
+            Ok(Some(turn)) => match &device_id {
+                Some(device) if &turn.device_id != device => Ok(DeleteTurn::Forbidden),
+                _ => store.delete_turn_by_id(&turn_id).map(DeleteTurn::Deleted),
+            },
+            Err(e) => Err(e),
+        }
+    })
+    .await;
+
+    let deleted = match result {
+        Ok(Ok(DeleteTurn::Missing)) => return error(StatusCode::NOT_FOUND, format!("no turn {turn_id}")),
+        Ok(Ok(DeleteTurn::Forbidden)) => {
+            return error(
+                StatusCode::FORBIDDEN,
+                format!(
+                    "device {} may not delete turn {turn_id}",
+                    device_id.unwrap_or_default()
+                ),
+            )
+        }
+        Ok(Ok(DeleteTurn::Deleted(n))) => n,
+        Ok(Err(e)) => return error(StatusCode::INTERNAL_SERVER_ERROR, e),
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+
+    tracing::info!(
+        turn_id,
+        caller = if owner { "owner" } else { "device" },
+        "conversation turn deleted"
+    );
+    Json(json!({ "deleted": deleted })).into_response()
+}
+
 pub fn routes() -> axum::Router<Arc<AppState>> {
     axum::Router::new()
         .route("/etern/sync/push", axum::routing::post(push))
+        .route(
+            "/etern/history/turn/delete",
+            axum::routing::post(delete_turn),
+        )
         .route("/etern/sync/window", axum::routing::get(window_endpoint))
         .route("/etern/memory/sync", axum::routing::post(sync_memory))
         .route(
@@ -1170,5 +1271,131 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["cleared"].as_u64(), Some(2));
+    }
+
+    #[tokio::test]
+    async fn delete_turn_requires_auth_and_a_turn_id() {
+        let (state, _) = test_state(Some("s3cret"));
+        let (status, _) = post(
+            app(state.clone()),
+            "/etern/history/turn/delete",
+            None,
+            serde_json::to_vec(&json!({ "turn_id": "whatever" })).unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        state
+            .store
+            .insert_turn(&sync_turn(1, "note").to_turn("desktop", "edge").unwrap())
+            .unwrap();
+        let (status, _) = post(
+            app(state),
+            "/etern/history/turn/delete",
+            Some("s3cret"),
+            serde_json::to_vec(&json!({ "turn_id": "  " })).unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn delete_turn_removes_one_exchange_without_resurrection() {
+        let (state, _) = test_state(Some("s3cret"));
+        let doomed = sync_turn(1, "please forget the monstera")
+            .to_turn("pixel-7", "edge")
+            .unwrap();
+        let doomed_id = doomed.id.to_string();
+        state.store.insert_turn(&doomed).unwrap();
+        state
+            .store
+            .insert_turn(&sync_turn(2, "the monstera stays").to_turn("pixel-7", "edge").unwrap())
+            .unwrap();
+
+        let (status, body) = post(
+            app(state.clone()),
+            "/etern/history/turn/delete",
+            Some("s3cret"),
+            serde_json::to_vec(&json!({ "turn_id": doomed_id })).unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["deleted"].as_u64(), Some(1));
+        assert!(state.store.turn_by_id(&doomed_id).unwrap().is_none());
+        assert_eq!(state.store.all_turns().unwrap().len(), 1);
+        assert!(state.store.search("forget", 5).unwrap().is_empty());
+
+        // An unknown id is 404, and the window only offers what survives.
+        let (status, _) = post(
+            app(state.clone()),
+            "/etern/history/turn/delete",
+            Some("s3cret"),
+            serde_json::to_vec(&json!({ "turn_id": TurnId::now_v7().to_string() })).unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, window) = get(
+            app(state),
+            "/etern/sync/window?device_id=pixel-7",
+            Some("s3cret"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "window request failed: {window}");
+        assert_eq!(
+            window["messages"].as_array().map(Vec::len),
+            Some(1),
+            "only the surviving turn should be offered: {window}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_device_may_delete_its_own_turn_but_not_another_devices() {
+        let (state, _) = test_state(Some("s3cret"));
+        state
+            .store
+            .register_device("pixel-7", "Fold", "dev-token", 1_000)
+            .unwrap();
+        let mine = sync_turn(1, "my garbage").to_turn("pixel-7", "edge").unwrap();
+        let mine_id = mine.id.to_string();
+        let theirs = sync_turn(1, "someone elses note")
+            .to_turn("galaxy-s", "edge")
+            .unwrap();
+        let theirs_id = theirs.id.to_string();
+        state.store.insert_turn(&mine).unwrap();
+        state.store.insert_turn(&theirs).unwrap();
+
+        let (status, body) = post(
+            app(state.clone()),
+            "/etern/history/turn/delete",
+            Some("dev-token"),
+            serde_json::to_vec(&json!({ "turn_id": mine_id })).unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["deleted"].as_u64(), Some(1));
+
+        let (status, _) = post(
+            app(state.clone()),
+            "/etern/history/turn/delete",
+            Some("dev-token"),
+            serde_json::to_vec(&json!({ "turn_id": theirs_id })).unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(state.store.turn_by_id(&theirs_id).unwrap().is_some());
+
+        // The owner may delete anything, including desktop-originated turns.
+        let chat = Turn::new(TurnKind::Chat, "desktop", 1, vec![Message::user("desktop chat")]);
+        let chat_id = chat.id.to_string();
+        state.store.insert_turn(&chat).unwrap();
+        let (status, body) = post(
+            app(state),
+            "/etern/history/turn/delete",
+            Some("s3cret"),
+            serde_json::to_vec(&json!({ "turn_id": chat_id })).unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["deleted"].as_u64(), Some(1));
     }
 }

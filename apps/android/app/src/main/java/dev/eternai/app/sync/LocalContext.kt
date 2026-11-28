@@ -152,6 +152,44 @@ class LocalContext(
         }
     }
 
+    /**
+     * Drops one exchange from everything the phone knows about it, returning whether
+     * anything was removed.
+     *
+     * All three lists have to be touched. *history* is what the UI renders, *local*
+     * holds the phone's own not-yet-synced copy, and *window* is what the edge model
+     * actually reads — leaving the turn in any one of them would keep it in the
+     * prompt or put it back on the next repaint. The persisted history cache is
+     * rewritten too, or a process restart would restore the deleted row.
+     *
+     * The desktop copy is a separate concern: see `OutboxSync.deleteTurn`, which
+     * pushes the deletion or queues it. A local-only delete is undone by the next
+     * window pull, since that window is built from the desktop's database.
+     */
+    fun deleteTurn(turnId: String): Boolean {
+        val removed: Boolean
+        val remaining: List<TurnDto>
+        synchronized(lock) {
+            // Deliberately not chained with `||`: short-circuiting would leave the
+            // turn in the lists the first predicate did not reach. `history` and
+            // `window` are immutable lists, so they are rebuilt rather than pruned.
+            val keptHistory = history.filterNot { it.turnId == turnId }
+            val fromHistory = keptHistory.size != history.size
+            history = keptHistory
+            val fromLocal = local.removeAll { it.turnId == turnId }
+            val trimmed = window.filterNot { it.turnId == turnId }
+            val fromWindow = trimmed.size != window.size
+            window = trimmed
+            removed = fromHistory || fromLocal || fromWindow
+            remaining = history.map { it.copy(messages = it.messages.toList()) }
+            if (removed) {
+                publishTurns()
+            }
+        }
+        if (removed) persistHistory(remaining)
+        return removed
+    }
+
     /** Throws if the core rejects a turn; callers surface it rather than swallowing. */
     @Throws(EternException::class)
     fun validate(turn: TurnDto): List<MessageDto> = turnMessages(turn)

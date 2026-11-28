@@ -473,6 +473,56 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /**
+     * Deletes the exchange a bubble belongs to.
+     *
+     * Bubbles are per message (`"turnId:index"`) but the store, the outbox and the
+     * sync protocol are all per turn, so the whole exchange goes: prompt, reply and
+     * any tool steps together. Removing one message row would leave tool calls
+     * answered by nothing, which the chat template rejects.
+     *
+     * Refused mid-generation: the in-flight turn is rendered from transient bubbles
+     * and would be overwritten by [finalize] a moment later.
+     */
+    fun deleteBubble(bubbleId: String) {
+        if (_ui.value.busy) {
+            _ui.update { it.copy(notice = "stop the current reply before deleting a message") }
+            return
+        }
+        val turnId = bubbleId.substringBefore(':')
+        if (turnId.isEmpty()) {
+            _ui.update { it.copy(notice = "that message has no id, so it cannot be deleted") }
+            return
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            when (val outcome = eternApp.deleteTurn(turnId)) {
+                is OutboxSync.DeleteOutcome.Removed -> _ui.update {
+                    it.copy(
+                        notice = if (outcome.deleted > 0) {
+                            "deleted the message and its reply"
+                        } else {
+                            "deleted; the desktop no longer had it either"
+                        },
+                    )
+                }
+
+                is OutboxSync.DeleteOutcome.Queued -> _ui.update {
+                    it.copy(
+                        notice = if (outcome.removedLocally) {
+                            "deleted here; the desktop will be told when you reconnect"
+                        } else {
+                            "not deleted: " + outcome.reason
+                        },
+                    )
+                }
+
+                is OutboxSync.DeleteOutcome.Failed -> _ui.update {
+                    it.copy(notice = "delete failed: " + outcome.message)
+                }
+            }
+        }
+    }
+
     /** Manual "sync now" for the settings sheet. */
     fun syncNow() {
         viewModelScope.launch(Dispatchers.IO) {
@@ -863,10 +913,18 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             is OutboxSync.TranscriptPull.Error -> withPersonality + ", history failed: " + transcript.message
             null -> withPersonality
         }
-        return when (val w = outcome.window) {
-            is OutboxSync.WindowPull.Installed -> withTranscript + ", window " + w.installed + "/" + w.proposed + " turn(s)"
-            is OutboxSync.WindowPull.Error -> withTranscript + ", window failed: " + w.message
+        val withDeletes = when (val deletes = outcome.deletes) {
             null -> withTranscript
+            else -> if (deletes.replayed > 0) {
+                withTranscript + ", replayed " + deletes.replayed + " deletion(s)"
+            } else {
+                withTranscript
+            }
+        }
+        return when (val w = outcome.window) {
+            is OutboxSync.WindowPull.Installed -> withDeletes + ", window " + w.installed + "/" + w.proposed + " turn(s)"
+            is OutboxSync.WindowPull.Error -> withDeletes + ", window failed: " + w.message
+            null -> withDeletes
         }
     }
 

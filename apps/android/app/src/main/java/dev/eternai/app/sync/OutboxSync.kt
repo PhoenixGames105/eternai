@@ -28,6 +28,7 @@ class OutboxSync(private val app: EternApplication) {
     private val prefs = app.prefs
     private val gateway = app.gateway
     private val outbox = app.outbox
+    private val pendingDeletes = app.pendingDeletes
     private val memory = LocalMemoryStore(File(app.filesDir, "memory/MEMORY.md"))
 
     /** Serialises flushes so two reconnects can't push the same batch twice. */
@@ -132,12 +133,113 @@ class OutboxSync(private val app: EternApplication) {
     /** Flush then pull: the whole reconnect handshake in one call. */
     suspend fun syncNow(): SyncOutcome {
         val report = flush()
-        if (!report.ok) return SyncOutcome(report, null, null, null, null)
+        if (!report.ok) return SyncOutcome(report, null, null, null, null, null)
+        // Replayed before the pulls below, so a turn deleted offline is already gone
+        // from the desktop store by the time we ask it for a transcript and a window.
+        val deletes = drainDeletes()
         val memoryReport = syncMemory()
         val personalityReport = syncPersonality()
         val transcript = pullTranscript()
         val pull = pullWindow()
-        return SyncOutcome(report, pull, memoryReport, personalityReport, transcript)
+        return SyncOutcome(report, pull, memoryReport, personalityReport, transcript, deletes)
+    }
+
+    /**
+     * Deletes one exchange: always locally, and on the desktop as soon as we can.
+     *
+     * When paired and reachable the gateway call goes out immediately and the local
+     * copy goes with it. Offline — or unpaired — the id is queued in
+     * [PendingDeletes] and replayed by [drainDeletes] on the next successful sync.
+     * Either way the phone stops showing and stops prompting with the turn right
+     * away; waiting for a connection to hide a message the user just deleted would
+     * be the wrong trade.
+     *
+     * Returns a human-readable account of what happened, suitable for a notice.
+     */
+    suspend fun deleteTurn(turnId: String): DeleteOutcome {
+        if (turnId.isBlank()) return DeleteOutcome.Failed("no turn id")
+
+        val removed = app.context.deleteTurn(turnId)
+        // No window-watermark reset is needed: `pullWindow` and `pullTranscript`
+        // are unconditional and *replace* what we hold, so the deleted turn can
+        // only come back if the desktop still has it — which is what the rest of
+        // this function is for.
+
+        val device = prefs.device
+            ?: return DeleteOutcome.Queued(
+                removed,
+                "not paired, so only the phone's copy was removed",
+            )
+
+        val body = JSONObject().put("turn_id", turnId).toString()
+        return try {
+            val response = JSONObject(gateway.post(PATH_DELETE_TURN, device, body))
+            if (response.has("error")) {
+                val message = response.optJSONObject("error")?.optString("message") ?: "gateway refused"
+                DeleteOutcome.Queued(removed, "desktop still holds it: $message")
+            } else {
+                DeleteOutcome.Removed(removed, response.optLong("deleted", 0L))
+            }
+        } catch (e: GatewayException) {
+            // 404 means the desktop already lacks the turn — nothing to queue.
+            if (e.status == 404) return DeleteOutcome.Removed(removed, 0L)
+            pendingDeletes.add(turnId)
+            DeleteOutcome.Queued(removed, describe(e))
+        } catch (e: Exception) {
+            pendingDeletes.add(turnId)
+            DeleteOutcome.Queued(removed, describe(e))
+        }
+    }
+
+    /**
+     * Replays queued deletions against the desktop.
+     *
+     * Each id is sent on its own and dropped from the queue only when the gateway
+     * accepts it (a 404 counts: the turn is already gone). An id the gateway
+     * refuses with 4xx other than 404 is dropped too — a 403 will never succeed on
+     * retry, and a queue that never drains would re-send the same batch forever.
+     * Transport failures keep their place for the next sync.
+     */
+    private suspend fun drainDeletes(): DeletesReport {
+        val queued = pendingDeletes.peek()
+        if (queued.isEmpty()) return DeletesReport(0, 0, 0, null)
+        val device = prefs.device ?: return DeletesReport(0, 0, queued.size, "not paired")
+
+        var done = 0
+        var error: String? = null
+        val stillQueued = mutableListOf<String>()
+
+        for ((index, turnId) in queued.withIndex()) {
+            val body = JSONObject().put("turn_id", turnId).toString()
+            // 4xx counts as settled: a 404 means the desktop already lacks the
+            // turn, and a 403 on a foreign turn will never succeed on retry.
+            // Keeping either in the queue would re-send it on every sync forever.
+            val settled = try {
+                gateway.post(PATH_DELETE_TURN, device, body)
+                true
+            } catch (e: GatewayException) {
+                error = describe(e)
+                e.status in 400..499
+            } catch (e: Exception) {
+                error = describe(e)
+                false
+            }
+
+            if (settled) {
+                done++
+            } else {
+                // The link died mid-drain; keep this id and everything after it,
+                // in order, for the next sync.
+                stillQueued.addAll(queued.drop(index))
+                break
+            }
+        }
+
+        pendingDeletes.replaceAll(stillQueued)
+        if (done > 0) {
+            Log.i(TAG, "replayed $done queued deletion(s), ${stillQueued.size} still queued")
+        }
+        return DeletesReport(done, stillQueued.size, queued.size, error)
     }
 
     /** Pulls the wider UI transcript independently of the edge model's small window. */
@@ -252,7 +354,32 @@ class OutboxSync(private val app: EternApplication) {
         val memory: MemorySyncReport?,
         val personality: PersonalitySyncReport?,
         val transcript: TranscriptPull?,
+        val deletes: DeletesReport? = null,
     )
+
+    /** Outcome of replaying the offline delete queue. */
+    data class DeletesReport(
+        val replayed: Int,
+        val remaining: Int,
+        val queued: Int,
+        val error: String? = null,
+    )
+
+    /** Outcome of one user-initiated deletion. */
+    sealed class DeleteOutcome {
+        /** True when the turn left the phone's own context. */
+        abstract val removedLocally: Boolean
+
+        /** The desktop confirmed it. */
+        data class Removed(override val removedLocally: Boolean, val deleted: Long) : DeleteOutcome()
+
+        /** The phone forgot it; the desktop will be told on the next sync. */
+        data class Queued(override val removedLocally: Boolean, val reason: String) : DeleteOutcome()
+
+        data class Failed(val message: String) : DeleteOutcome() {
+            override val removedLocally: Boolean get() = false
+        }
+    }
     data class MemorySyncReport(val error: String? = null) {
         val ok: Boolean get() = error == null
     }
@@ -268,6 +395,7 @@ class OutboxSync(private val app: EternApplication) {
         const val PATH_MEMORY_SYNC = "/etern/memory/sync"
         const val PATH_PERSONALITY_SYNC = "/etern/personality/sync"
         const val PATH_CLEAR = "/etern/history/clear"
+        const val PATH_DELETE_TURN = "/etern/history/turn/delete"
         const val DEFAULT_EDGE_CTX = 8192L
         const val DEFAULT_RESPONSE_RESERVE = 700L
         const val DEFAULT_EDGE_OVERHEAD = 400L

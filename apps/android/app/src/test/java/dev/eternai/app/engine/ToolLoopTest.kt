@@ -1,4 +1,4 @@
-﻿package dev.eternai.app.engine
+package dev.eternai.app.engine
 
 import dev.eternai.app.tools.ToolCall
 import dev.eternai.app.tools.ToolResult
@@ -83,7 +83,7 @@ class ToolLoopTest {
         val runner = FakeRunner(emptyList())
         val streamed = StringBuilder()
 
-        val outcome = ToolLoop(engine, runner, "turn-1").run(history()) { streamed.append(it) }
+        val outcome = ToolLoop(engine, runner, "turn-1").run(history(), onChunk = { streamed.append(it) })
 
         assertEquals("noted", outcome.text)
         assertEquals(1, outcome.rounds)
@@ -137,7 +137,7 @@ class ToolLoopTest {
         val engine = FakeEngine(listOf(reply("", call()), reply("done")))
         val runner = FakeRunner(listOf(listOf(failure(retryable = true)), listOf(success())))
 
-        val outcome = ToolLoop(engine, runner, "turn-3").run(history()) { }
+        val outcome = ToolLoop(engine, runner, "turn-3").run(history(), onChunk = { })
 
         assertEquals(2, runner.batchesSeen.size)
         assertEquals(listOf("call-1"), runner.batchesSeen[1].map { it.id })
@@ -152,7 +152,7 @@ class ToolLoopTest {
         val engine = FakeEngine(listOf(reply("", call()), reply("could not save")))
         val runner = FakeRunner(listOf(listOf(failure(retryable = true))))
 
-        val outcome = ToolLoop(engine, runner, "turn-4").run(history()) { }
+        val outcome = ToolLoop(engine, runner, "turn-4").run(history(), onChunk = { })
 
         assertEquals(2, runner.batchesSeen.size)
         val fed = outcome.steps[1].content
@@ -167,7 +167,7 @@ class ToolLoopTest {
         val engine = FakeEngine(listOf(reply("", call()), reply("sorry")))
         val runner = FakeRunner(listOf(listOf(failure(retryable = false))))
 
-        ToolLoop(engine, runner, "turn-5").run(history()) { }
+        ToolLoop(engine, runner, "turn-5").run(history(), onChunk = { })
 
         assertEquals(1, runner.batchesSeen.size)
     }
@@ -177,7 +177,7 @@ class ToolLoopTest {
         val engine = FakeEngine(List(ToolLoop.MAX_ROUNDS + 2) { reply("", call(id = "call-$it")) })
         val runner = FakeRunner(List(ToolLoop.MAX_ROUNDS + 2) { listOf(success(id = "call-$it")) })
 
-        val outcome = ToolLoop(engine, runner, "turn-6").run(history()) { }
+        val outcome = ToolLoop(engine, runner, "turn-6").run(history(), onChunk = { })
 
         assertTrue(outcome.aborted)
         assertEquals(ToolLoop.MAX_ROUNDS, outcome.rounds)
@@ -195,7 +195,7 @@ class ToolLoopTest {
         // The runner answers out of order; the loop must not re-pair them.
         val runner = FakeRunner(listOf(listOf(success(id = "b", name = "read_file"), success(id = "a", name = "remember"))))
 
-        val outcome = ToolLoop(engine, runner, "turn-7").run(history()) { }
+        val outcome = ToolLoop(engine, runner, "turn-7").run(history(), onChunk = { })
 
         assertEquals(listOf("b", "a"), outcome.steps.drop(1).map { it.toolCallId })
         assertEquals(listOf("read_file", "remember"), outcome.steps.drop(1).map { it.name })
@@ -209,7 +209,7 @@ class ToolLoopTest {
         val second = listOf(success(id = "a", name = "remember"))
         val runner = FakeRunner(listOf(first, second))
 
-        val outcome = ToolLoop(engine, runner, "turn-8").run(history()) { }
+        val outcome = ToolLoop(engine, runner, "turn-8").run(history(), onChunk = { })
 
         assertEquals(2, runner.batchesSeen.size)
         assertEquals(listOf("a", "b"), outcome.steps.drop(1).map { it.toolCallId })

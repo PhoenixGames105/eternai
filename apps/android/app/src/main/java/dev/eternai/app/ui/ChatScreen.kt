@@ -251,7 +251,7 @@ fun ChatScreen(vm: ChatViewModel) {
                         modifier = Modifier.fillMaxSize(),
                     ) {
                         items(bubbles, key = { it.id + it.role }) { bubble ->
-                            BubbleRow(bubble)
+                            BubbleRow(bubble, onDelete = { vm.deleteBubble(bubble.id) })
                         }
                         if (ui.busy && bubbles.lastOrNull()?.role != "assistant") {
                             item {
@@ -900,17 +900,19 @@ private fun ModelSheet(vm: ChatViewModel) {
 }
 
 @Composable
-private fun BubbleRow(bubble: ChatViewModel.Bubble) {
-    // Long-press copies the message; the toast confirms it because the
-    // clipboard write itself is silent.
+private fun BubbleRow(bubble: ChatViewModel.Bubble, onDelete: () -> Unit) {
+    // Long-press opens a small menu. Copy alone used to be the whole gesture, but
+    // deleting a message the model keeps re-reading needs an escape hatch that is
+    // not buried in Settings.
     val clipboard = LocalClipboardManager.current
     val context = LocalContext.current
-    val copyModifier = if (bubble.role != "tool" && bubble.text.isNotBlank() && !bubble.streaming) {
+    var menuOpen by remember(bubble.id) { mutableStateOf(false) }
+    var confirmDelete by remember(bubble.id) { mutableStateOf(false) }
+    val deletable = !bubble.streaming
+    val copyable = bubble.role != "tool" && bubble.text.isNotBlank() && !bubble.streaming
+    val menuModifier = if (deletable) {
         Modifier.pointerInput(bubble.id) {
-            detectTapGestures(onLongPress = {
-                clipboard.setText(AnnotatedString(bubble.text))
-                Toast.makeText(context, "copied to clipboard", Toast.LENGTH_SHORT).show()
-            })
+            detectTapGestures(onLongPress = { menuOpen = true })
         }
     } else {
         Modifier
@@ -950,27 +952,76 @@ private fun BubbleRow(bubble: ChatViewModel.Bubble) {
         Modifier.fillMaxWidth(),
         horizontalArrangement = if (fromUser) Arrangement.End else Arrangement.Start,
     ) {
-        Card(
-            shape = RoundedCornerShape(14.dp),
-            colors = CardDefaults.cardColors(
-                containerColor = if (fromUser) {
-                    MaterialTheme.colorScheme.primary
-                } else {
-                    MaterialTheme.colorScheme.surfaceVariant
-                },
-            ),
-            modifier = Modifier.widthIn(max = 520.dp).then(copyModifier),
-        ) {
-            Column(Modifier.padding(12.dp)) {
-                if (!fromUser) {
-                    Text(
-                        bubble.text.ifEmpty { if (bubble.streaming) "..." else "" },
-                        style = MaterialTheme.typography.bodyMedium,
-                    )
-                } else {
-                    Text(bubble.text, style = MaterialTheme.typography.bodyMedium)
+        // The menu is anchored to the bubble itself so it drops where the finger
+        // was, rather than at the far edge of the row.
+        Box {
+            Card(
+                shape = RoundedCornerShape(14.dp),
+                colors = CardDefaults.cardColors(
+                    containerColor = if (fromUser) {
+                        MaterialTheme.colorScheme.primary
+                    } else {
+                        MaterialTheme.colorScheme.surfaceVariant
+                    },
+                ),
+                modifier = Modifier.widthIn(max = 520.dp).then(menuModifier),
+            ) {
+                Column(Modifier.padding(12.dp)) {
+                    if (!fromUser) {
+                        Text(
+                            bubble.text.ifEmpty { if (bubble.streaming) "..." else "" },
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                    } else {
+                        Text(bubble.text, style = MaterialTheme.typography.bodyMedium)
+                    }
                 }
             }
+            DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                DropdownMenuItem(
+                    text = { Text("Copy") },
+                    enabled = copyable,
+                    onClick = {
+                        menuOpen = false
+                        clipboard.setText(AnnotatedString(bubble.text))
+                        Toast.makeText(context, "copied to clipboard", Toast.LENGTH_SHORT).show()
+                    },
+                )
+                DropdownMenuItem(
+                    text = { Text("Delete") },
+                    onClick = {
+                        menuOpen = false
+                        confirmDelete = true
+                    },
+                )
+            }
         }
+    }
+
+    if (confirmDelete) {
+        // Deleting takes the whole exchange, not just this bubble, because the
+        // store and the sync protocol both key on turns — say so before it goes.
+        AlertDialog(
+            onDismissRequest = { confirmDelete = false },
+            title = { Text("Delete this exchange?") },
+            text = {
+                Text(
+                    "Removes this message together with its reply and any tool steps, " +
+                        "here and on the desktop. The desktop is told immediately, or " +
+                        "as soon as you reconnect if it is offline."
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        confirmDelete = false
+                        onDelete()
+                    },
+                ) { Text("Delete") }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmDelete = false }) { Text("Cancel") }
+            },
+        )
     }
 }

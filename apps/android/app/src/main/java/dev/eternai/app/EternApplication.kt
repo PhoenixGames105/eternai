@@ -9,6 +9,7 @@ import dev.eternai.app.net.GatewayClient
 import dev.eternai.app.net.HealthProbe
 import dev.eternai.app.sync.LocalContext
 import dev.eternai.app.sync.OutboxSync
+import dev.eternai.app.sync.PendingDeletes
 import dev.eternai.app.sync.TranscriptCache
 import dev.eternai.core.Outbox
 import kotlinx.coroutines.CoroutineScope
@@ -42,6 +43,10 @@ class EternApplication : Application() {
     lateinit var context: LocalContext
         private set
     lateinit var sync: OutboxSync
+        private set
+
+    /** Turns deleted while offline, replayed against the desktop on the next sync. */
+    internal lateinit var pendingDeletes: PendingDeletes
         private set
 
     /** Embedded llama.cpp server reached over loopback; the default edge engine. */
@@ -83,6 +88,7 @@ class EternApplication : Application() {
         } catch (e: Exception) {
             Log.e(TAG, "pending turns could not be restored from outbox", e)
         }
+        pendingDeletes = PendingDeletes(File(filesDir, PENDING_DELETES_FILE))
         sync = OutboxSync(this)
         // Constructing the engines is cheap; the GGUF itself is only mapped into
         // memory the first time a prompt actually needs it.
@@ -156,6 +162,38 @@ class EternApplication : Application() {
         syncMutex.withLock { context.append(turn) }
     }
 
+    /**
+     * Deletes one exchange everywhere: the phone's context, the outbox, and the
+     * desktop's copy — or a tombstone if the desktop is out of reach.
+     *
+     * Taking the turn out of the outbox matters as much as taking it out of the
+     * context. An offline turn that was never pushed would otherwise be flushed
+     * to the desktop on the next reconnect, and `onCreate` restores the visible
+     * transcript from that same file, so a deleted message would come back after
+     * a restart. The outbox has no delete method (it is an append-only insert
+     * log acked as one batch), so it is rewritten from what survives.
+     *
+     * Serialised on [syncMutex] so a periodic flush cannot read the outbox
+     * mid-rewrite.
+     */
+    suspend fun deleteTurn(turnId: String): OutboxSync.DeleteOutcome = syncMutex.withLock {
+        dropOutboxTurn(turnId)
+        sync.deleteTurn(turnId)
+    }
+
+    private fun dropOutboxTurn(turnId: String) {
+        val pending = runCatching { outbox.readAll() }.getOrNull() ?: return
+        if (pending.turns.none { it.turnId == turnId }) return
+        val kept = pending.turns.filter { it.turnId != turnId }
+        try {
+            outbox.clear()
+            kept.forEach { outbox.appendSyncTurn(it) }
+            Log.i(TAG, "removed $turnId from the outbox")
+        } catch (e: Exception) {
+            Log.e(TAG, "outbox could not be rewritten after a delete", e)
+        }
+    }
+
     suspend fun clearConversation(): Result<Long> = syncMutex.withLock {
         val paired = prefs.paired
         if (paired) sync.flush()
@@ -163,6 +201,9 @@ class EternApplication : Application() {
             IllegalStateException("not paired"),
         )
         runCatching { outbox.clear() }
+        // The whole transcript is gone; tombstones for individual turns have
+        // nothing left to protect against.
+        runCatching { pendingDeletes.replaceAll(emptyList()) }
         context.clearAll()
         remote
     }
@@ -188,4 +229,5 @@ class EternApplication : Application() {
 }
 
 private const val OUTBOX_FILE = "outbox.jsonl"
+private const val PENDING_DELETES_FILE = "pending-deletes.jsonl"
 private const val TRANSCRIPT_CACHE_FILE = "transcript.json"

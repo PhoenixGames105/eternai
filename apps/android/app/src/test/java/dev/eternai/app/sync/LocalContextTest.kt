@@ -100,6 +100,47 @@ class LocalContextTest {
         )
     }
 
+    @Test
+    fun deleteTurnRemovesItFromTranscriptPendingTurnsAndModelWindow() {
+        val persisted = mutableListOf<List<TurnDto>>()
+        val context = LocalContext({}, { persisted.add(it) })
+        context.setHistory(listOf(turn("keep", "stay"), turn("doomed", "go")))
+        context.setWindow(listOf(turn("doomed", "go"), turn("keep", "stay")))
+        context.append(
+            SyncTurnDto("local-doomed", 3, 1, true, listOf(message("user", "unsynced and doomed"))),
+        )
+
+        assertEquals(
+            listOf("keep", "doomed", "local-doomed"),
+            context.turns.value.map { it.turnId },
+        )
+
+        assert(context.deleteTurn("doomed"))
+        assert(context.deleteTurn("local-doomed"))
+
+        assertEquals(listOf("keep"), context.turns.value.map { it.turnId })
+        assertEquals(listOf("keep"), context.turnsForEdgeWindow().map { it.turnId })
+        assertEquals(listOf("stay"), context.messages().map { it.content })
+        // The persisted cache has to match, or a restart restores the deleted row.
+        assertEquals(listOf("keep"), persisted.last().map { it.turnId })
+
+        // Unknown ids report failure and leave everything alone.
+        assert(!context.deleteTurn("never-existed"))
+        assertEquals(listOf("keep"), context.turns.value.map { it.turnId })
+    }
+
+    @Test
+    fun deletingATurnThatIsOnlyInTheWindowStillTrimsTheModelPrompt() {
+        val context = LocalContext({})
+        context.setHistory(listOf(turn("visible", "shown")))
+        context.setWindow(listOf(turn("hidden", "in the prompt only"), turn("visible", "shown")))
+
+        assert(context.deleteTurn("hidden"))
+
+        assertEquals(listOf("visible"), context.turns.value.map { it.turnId })
+        assertEquals(listOf("shown"), context.messages().map { it.content })
+    }
+
     private fun turn(id: String, text: String) = TurnDto(
         id,
         1,

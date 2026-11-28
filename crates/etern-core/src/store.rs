@@ -540,6 +540,28 @@ impl Store {
         Ok(turns)
     }
 
+    /// Deletes exactly one turn by id, returning how many rows went (0 or 1).
+    ///
+    /// This is the surgical lever behind "remove that message from my context":
+    /// the phone offers the whole exchange (prompt, reply, tool steps) as the
+    /// unit of deletion because that is what the store and the sync protocol
+    /// both use. Removing a single message row instead would leave a user
+    /// message whose tool calls are answered by nothing — a shape the chat
+    /// template rejects.
+    ///
+    /// Like [`Store::delete_turns_for_device`], the FTS sidecar has no triggers
+    /// and is pruned in the same transaction. Messages go by cascade.
+    pub fn delete_turn_by_id(&self, id: &str) -> CoreResult<u64> {
+        let conn = self.lock();
+        let tx = conn.unchecked_transaction()?;
+        let turns = tx.execute("DELETE FROM turns WHERE id = ?1", params![id])? as u64;
+        if turns > 0 {
+            tx.execute("DELETE FROM turns_fts WHERE turn_id = ?1", params![id])?;
+        }
+        tx.commit()?;
+        Ok(turns)
+    }
+
     /// Timestamp of the oldest stored turn — the starting point for a journal
     /// catch-up sweep.
     pub fn first_turn_ts(&self) -> CoreResult<Option<i64>> {
@@ -770,6 +792,43 @@ mod tests {
 
         // Idempotent: a second clear is a no-op, not an error.
         assert_eq!(store.delete_all_turns().unwrap(), 0);
+    }
+
+    #[test]
+    fn delete_turn_by_id_removes_one_exchange_and_its_search_row() {
+        let store = Store::open_in_memory().unwrap();
+        let doomed = turn("phone", 1, "please forget the monstera");
+        let keep = turn("phone", 2, "the monstera stays");
+        let doomed_id = doomed.id.to_string();
+        let keep_id = keep.id.to_string();
+        store.insert_turn(&doomed).unwrap();
+        store.insert_turn(&keep).unwrap();
+
+        assert_eq!(store.delete_turn_by_id(&doomed_id).unwrap(), 1);
+
+        assert!(store.turn_by_id(&doomed_id).unwrap().is_none());
+        assert!(store.turn_by_id(&keep_id).unwrap().is_some());
+        assert_eq!(store.all_turns().unwrap().len(), 1);
+        // The sidecar has no triggers; a stale row would still hit search.
+        let hits = store.search("monstera", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].turn_id, keep_id);
+        // Cascade took the messages with it. Scoped so the store mutex is
+        // released before the next call, which locks again.
+        let orphans = {
+            let conn = store.lock();
+            conn.query_row(
+                "SELECT COUNT(*) FROM messages WHERE turn_id = ?1",
+                params![doomed_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(orphans, 0);
+
+        // Deleting the same id twice, or an unknown id, is a no-op.
+        assert_eq!(store.delete_turn_by_id(&doomed_id).unwrap(), 0);
+        assert_eq!(store.delete_turn_by_id("not-a-turn").unwrap(), 0);
     }
 
     #[test]
